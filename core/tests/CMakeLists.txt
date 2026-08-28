@@ -1,5 +1,6 @@
 set(EUDORA_TEST_SOURCES
-  test_compat.cpp)
+  test_compat.cpp
+  test_mailstore.cpp)
 
 foreach(src ${EUDORA_TEST_SOURCES})
   get_filename_component(name ${src} NAME_WE)

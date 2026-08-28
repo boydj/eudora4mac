@@ -45,7 +45,16 @@ endif()
 
 # Sources are appended here as each subsystem lands.
 target_sources(eudora_core PRIVATE
-  compat/pstring.cpp)
+  compat/pstring.cpp
+  compat/macroman.cpp
+  compat/macdate.cpp
+  compat/hashes.cpp
+  mailstore/table_of_contents.cpp
+  mailstore/toc_format.cpp
+  mailstore/toc_io.cpp
+  mailstore/line_reader.cpp
+  mailstore/mbox_parser.cpp
+  mailstore/compaction.cpp)
 
 if(EUDORA_ENABLE_TLS)
   find_package(OpenSSL QUIET)
