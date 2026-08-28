@@ -180,7 +180,7 @@ final class AppModel: ObservableObject {
         let inboxPath = mailFolder.appendingPathComponent("In").path
 
         Task.detached {
-            var result: Result<Int, Error>
+            let result: Result<Int, Error>
             do {
                 let tls: TLSMode = {
                     switch account.popSecurity {
@@ -270,18 +270,20 @@ final class AppModel: ObservableObject {
                     break
                 }
             }
+            let sentFinal = sent
+            let failureFinal = failure
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 if let out = self.mailbox(named: "Out") {
                     // Mark sent, highest index first so indices stay valid.
-                    for index in sent.sorted(by: >) {
+                    for index in sentFinal.sorted(by: >) {
                         out.setState(.sent, at: index)
                     }
                     try? out.save()
                 }
                 self.refreshMailbox(named: "Out")
-                self.statusText = failure.map { "Send failed: \($0)" }
-                    ?? "Sent \(sent.count) message\(sent.count == 1 ? "" : "s")."
+                self.statusText = failureFinal.map { "Send failed: \($0)" }
+                    ?? "Sent \(sentFinal.count) message\(sentFinal.count == 1 ? "" : "s")."
             }
         }
     }

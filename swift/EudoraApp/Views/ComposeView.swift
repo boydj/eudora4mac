@@ -210,8 +210,9 @@ struct ComposeView: View {
             } catch {
                 failure = "\(error)"
             }
+            let failureFinal = failure
             await MainActor.run {
-                if let failure {
+                if let failure = failureFinal {
                     model.statusText = "Send failed: \(failure)"
                 } else {
                     // Keep a copy in Out marked sent (FLAG_KEEP_COPY spirit).
