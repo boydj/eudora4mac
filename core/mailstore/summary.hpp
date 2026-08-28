@@ -164,6 +164,15 @@ struct MessageSummary {
     }
 };
 
+// Display2Prior (boxact.h:58): 1-5 display priority back to the 1-200
+// internal scale (inverse of MessageSummary::display_priority).
+inline std::uint8_t display_to_priority(long display) {
+    const long p = display * 40;
+    if (p <= 0)
+        return 0;
+    return static_cast<std::uint8_t>(p > 200 ? 200 : p);
+}
+
 // TOC versioning (Include/mailbox.h:130-137).
 inline constexpr std::int16_t kCurrentTocVersion = 1;
 inline constexpr std::int16_t kCurrentTocMinorVersion = 9;

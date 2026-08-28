@@ -362,6 +362,40 @@ int fetch_progress_cb(void *ctx, const char *stage, int32_t done,
 
 } // namespace
 
+TEST_CASE("C API: POP3 big-message limit skips oversized mail") {
+    MiniPop3Server server;
+    server.add_message("uid-small",
+                       "From: s@example.com\r\nSubject: small\r\n\r\ntiny\r\n");
+    std::string big = "From: b@example.com\r\nSubject: big\r\n\r\n";
+    big += std::string(4096, 'x');
+    big += "\r\n";
+    server.add_message("uid-big", std::move(big));
+    CHECK(server.start(1));
+
+    const fs::path box = temp_dir() / "BigLimitBox";
+    std::error_code ec;
+    fs::remove(box, ec);
+    fs::remove(box.string() + ".toc", ec);
+
+    eudora_pop3_options opts{};
+    opts.max_message_k = 1; // skip anything over 1 KB
+    const int32_t n = eudora_pop3_fetch_opts(
+        "127.0.0.1", server.port, EUDORA_TLS_NONE, "user", "pass",
+        box.string().c_str(), &opts, nullptr, nullptr);
+    server.finish();
+
+    CHECK_EQ(n, 1);
+    eudora_mailbox *mb = eudora_mailbox_open(box.string().c_str());
+    CHECK(mb != nullptr);
+    if (mb) {
+        CHECK_EQ(eudora_mailbox_count(mb), 1);
+        eudora_summary sum{};
+        CHECK(eudora_mailbox_summary(mb, 0, &sum));
+        CHECK_EQ(std::string(sum.subject), "small");
+        eudora_mailbox_close(mb);
+    }
+}
+
 TEST_CASE("C API: POP3 UIDL dedup, progress, and cancel") {
     MiniPop3Server server;
     server.add_message("uid-alpha",
@@ -431,6 +465,42 @@ TEST_CASE("C API: POP3 UIDL dedup, progress, and cancel") {
     server.finish();
 }
 #endif // !_WIN32
+
+TEST_CASE("C API: summary setters and find-by-serial") {
+    const fs::path box = temp_dir() / "SetterBox";
+    write_file(box, kMailbox + kMailbox);
+    eudora_mailbox *mb = eudora_mailbox_open(box.string().c_str());
+    CHECK(mb != nullptr);
+    if (!mb)
+        return;
+
+    eudora_summary sum{};
+    CHECK(eudora_mailbox_summary(mb, 1, &sum));
+    CHECK_EQ(eudora_mailbox_find_by_serial(mb, sum.serial_num), 1);
+    CHECK_EQ(eudora_mailbox_find_by_serial(mb, 999999), -1);
+    CHECK(sum.arrival_unix > 0);
+
+    CHECK(eudora_mailbox_set_priority(mb, 0, 5));
+    CHECK(eudora_mailbox_set_priority(mb, 1, 1));
+    CHECK(!eudora_mailbox_set_priority(mb, 1, 6)); // out of the 1-5 scale
+    CHECK(eudora_mailbox_set_spam_score(mb, 1, 200)); // clamps to 127
+    CHECK(eudora_mailbox_set_subject(mb, 1, "renamed subject"));
+    CHECK(eudora_mailbox_save(mb));
+    eudora_mailbox_close(mb);
+
+    mb = eudora_mailbox_open(box.string().c_str());
+    CHECK(mb != nullptr);
+    if (mb) {
+        eudora_summary again{};
+        CHECK(eudora_mailbox_summary(mb, 0, &again));
+        CHECK_EQ(again.priority_display, 5);
+        CHECK(eudora_mailbox_summary(mb, 1, &again));
+        CHECK_EQ(again.priority_display, 1);
+        CHECK_EQ(again.spam_score, 127);
+        CHECK_EQ(std::string(again.subject), "renamed subject");
+        eudora_mailbox_close(mb);
+    }
+}
 
 TEST_CASE("C API: mailbox append message") {
     const fs::path box = temp_dir() / "AppendBox";

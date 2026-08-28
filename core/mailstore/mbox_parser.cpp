@@ -154,14 +154,6 @@ bool is_bulk_sender(std::string_view header_line) {
     return false;
 }
 
-// Display2Prior (boxact.h:58).
-std::uint8_t display_to_priority(long display) {
-    const long p = display * 40;
-    if (p <= 0)
-        return 0;
-    return static_cast<std::uint8_t>(p > 200 ? 200 : p);
-}
-
 } // namespace
 
 // ---- IsFromLine ------------------------------------------------------------

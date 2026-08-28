@@ -159,6 +159,7 @@ int eudora_mailbox_summary(const eudora_mailbox *mb, int32_t index,
     out->msg_id_hash = s.msg_id_hash;
     out->from = s.from.c_str();
     out->subject = s.subject.c_str();
+    out->arrival_unix = mac_to_unix(s.arrival_seconds);
     return 1;
 }
 
@@ -196,6 +197,45 @@ int eudora_mailbox_set_label(eudora_mailbox *mb, int32_t index, int label) {
     flags = (flags & ~(0xFu << 14)) |
             (static_cast<std::uint32_t>(label) << 14);
     return 1;
+}
+
+int eudora_mailbox_set_priority(eudora_mailbox *mb, int32_t index,
+                                int display_priority) {
+    if (!mb || index < 0 || index >= mb->toc.count() ||
+        display_priority < 1 || display_priority > 5) {
+        set_error("bad priority or index");
+        return 0;
+    }
+    mb->toc.sums[static_cast<std::size_t>(index)].priority =
+        display_to_priority(display_priority);
+    return 1;
+}
+
+int eudora_mailbox_set_spam_score(eudora_mailbox *mb, int32_t index,
+                                  int score) {
+    if (!mb || index < 0 || index >= mb->toc.count()) {
+        set_error("summary index out of range");
+        return 0;
+    }
+    const int clamped = score < -128 ? -128 : (score > 127 ? 127 : score);
+    mb->toc.sums[static_cast<std::size_t>(index)].spam_score =
+        static_cast<std::int8_t>(clamped);
+    return 1;
+}
+
+int eudora_mailbox_set_subject(eudora_mailbox *mb, int32_t index,
+                               const char *subject) {
+    if (!mb || !subject || index < 0 || index >= mb->toc.count()) {
+        set_error("bad subject or index");
+        return 0;
+    }
+    mb->toc.sums[static_cast<std::size_t>(index)].subject = subject;
+    return 1;
+}
+
+int32_t eudora_mailbox_find_by_serial(const eudora_mailbox *mb,
+                                      int32_t serial_num) {
+    return mb ? mb->toc.find_by_serial(serial_num) : -1;
 }
 
 int eudora_mailbox_delete(eudora_mailbox *mb, int32_t index) {
@@ -491,14 +531,18 @@ int32_t eudora_mailbox_append_message(eudora_mailbox *mb, const char *raw,
     return mb->toc.count() - 1;
 }
 
-int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
-                             const char *user, const char *password,
-                             const char *mbox_path, int delete_from_server,
-                             eudora_progress_fn progress, void *ctx) {
+int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
+                               const char *user, const char *password,
+                               const char *mbox_path,
+                               const eudora_pop3_options *options,
+                               eudora_progress_fn progress, void *ctx) {
     if (!host || !user || !password || !mbox_path) {
         set_error("missing argument");
         return -1;
     }
+    const eudora_pop3_options opts =
+        options ? *options : eudora_pop3_options{0, 0, 0};
+    const int delete_from_server = opts.delete_from_server;
 
     TransportBundle bundle;
     Transport *transport = bundle.setup(tls_mode);
@@ -586,8 +630,13 @@ int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
     std::map<long, std::string> uids;
     const bool have_uidl = count > 0 && pop.uidl(uids);
 
+    // Sizes are needed only for the big-message limit (FillSizesWithList).
+    std::map<long, long> sizes;
+    if (opts.max_message_k > 0)
+        pop.list(sizes);
+
     std::vector<std::pair<long, std::uint32_t>> wanted; // msg number, uid hash
-    std::vector<long> already;                          // fetched previously
+    std::vector<std::pair<long, int>> already; // msg number, summary index
     for (long m = 1; m <= count; ++m) {
         std::uint32_t h = kNeverHashed;
         if (have_uidl) {
@@ -595,24 +644,46 @@ int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
             if (it != uids.end())
                 h = kr_hash(it->second);
         }
-        if (valid_hash(h) && mb->toc.find_by_hash(h) >= 0)
-            already.push_back(m);
-        else
-            wanted.emplace_back(m, h);
+        int idx = -1;
+        if (valid_hash(h))
+            idx = mb->toc.find_by_hash(h);
+        if (idx >= 0) {
+            already.emplace_back(m, idx);
+            continue;
+        }
+        if (opts.max_message_k > 0) {
+            const auto sz = sizes.find(m);
+            if (sz != sizes.end() &&
+                sz->second > static_cast<long>(opts.max_message_k) * 1024)
+                continue; // over the limit: leave it on the server
+        }
+        wanted.emplace_back(m, h);
     }
 
     int32_t fetched = 0;
     bool ok = true;
 
-    // With "delete from server" on, messages stored on an earlier check are
-    // deleted without downloading them again.
-    if (delete_from_server) {
-        for (const long m : already) {
-            if (!pop.dele(m)) {
-                set_error("DELE failed: " + pop.last_response());
-                ok = false;
-                break;
-            }
+    // Server-side cleanup of mail stored on an earlier check: everything
+    // with "delete from server" on, or just what has aged past the
+    // leave-on-server window (PREF_LMOS_XDAYS bookkeeping).
+    std::uint32_t age_cutoff = 0;
+    if (!delete_from_server && opts.leave_on_server_days > 0) {
+        const std::uint32_t window =
+            static_cast<std::uint32_t>(opts.leave_on_server_days) * 86400u;
+        const std::uint32_t now = mac_now_utc();
+        age_cutoff = now > window ? now - window : 1;
+    }
+    for (const auto &[m, idx] : already) {
+        const bool expired =
+            age_cutoff != 0 &&
+            mb->toc.sums[static_cast<std::size_t>(idx)].arrival_seconds <
+                age_cutoff;
+        if (!delete_from_server && !expired)
+            continue;
+        if (!pop.dele(m)) {
+            set_error("DELE failed: " + pop.last_response());
+            ok = false;
+            break;
         }
     }
 
@@ -665,6 +736,15 @@ int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
         return fetched;
     }
     return ok ? fetched : -1;
+}
+
+int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
+                             const char *user, const char *password,
+                             const char *mbox_path, int delete_from_server,
+                             eudora_progress_fn progress, void *ctx) {
+    const eudora_pop3_options opts{delete_from_server, 0, 0};
+    return eudora_pop3_fetch_opts(host, port, tls_mode, user, password,
+                                  mbox_path, &opts, progress, ctx);
 }
 
 int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,

@@ -41,10 +41,14 @@ enum {
     EUDORA_STATE_UNREAD = 1,
     EUDORA_STATE_READ = 2,
     EUDORA_STATE_REPLIED = 3,
-    EUDORA_STATE_FORWARDED = 8,
-    EUDORA_STATE_SENT = 9,
+    EUDORA_STATE_REDISTRIBUTED = 4,
+    EUDORA_STATE_UNSENDABLE = 5,
     EUDORA_STATE_SENDABLE = 6,
     EUDORA_STATE_QUEUED = 7,
+    EUDORA_STATE_FORWARDED = 8,
+    EUDORA_STATE_SENT = 9,
+    EUDORA_STATE_UNSENT = 10,
+    EUDORA_STATE_TIMED = 11,
     EUDORA_STATE_REBUILT = 14
 };
 
@@ -65,6 +69,8 @@ typedef struct {
     uint32_t msg_id_hash;
     const char *from;    /* valid until the mailbox handle is freed/reloaded */
     const char *subject;
+    /* New fields are appended only, so older callers stay layout-stable. */
+    int64_t arrival_unix; /* when the message arrived here, Unix epoch UTC */
 } eudora_summary;
 
 /* Open a mailbox: reads "<path>.toc" when present and valid, else rebuilds
@@ -84,6 +90,17 @@ char *eudora_mailbox_read_message(const eudora_mailbox *mb, int32_t index);
 int eudora_mailbox_set_state(eudora_mailbox *mb, int32_t index, uint8_t state);
 /* Set the label color index (0-15; bits 14-17 of flags). */
 int eudora_mailbox_set_label(eudora_mailbox *mb, int32_t index, int label);
+/* Set the display priority (1-5, 3 = normal; scaled like Display2Prior). */
+int eudora_mailbox_set_priority(eudora_mailbox *mb, int32_t index,
+                                int display_priority);
+/* Set the junk score (clamped to -128..127; JunkSetScore). */
+int eudora_mailbox_set_spam_score(eudora_mailbox *mb, int32_t index, int score);
+/* Replace the summary's subject (the stored message text is unchanged). */
+int eudora_mailbox_set_subject(eudora_mailbox *mb, int32_t index,
+                               const char *subject);
+/* Index of the summary with the given serial number, or -1 (FindSumBySerialNum). */
+int32_t eudora_mailbox_find_by_serial(const eudora_mailbox *mb,
+                                      int32_t serial_num);
 /* Append a complete RFC 822 message (any line-end convention) to the mbox
  * with a proper sendmail envelope, add its summary (state 0 keeps the
  * scanner's verdict), and return the new index, or -1.  Call
@@ -160,6 +177,28 @@ int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
                              const char *user, const char *password,
                              const char *mbox_path, int delete_from_server,
                              eudora_progress_fn progress, void *ctx);
+
+/* Checking-mail options beyond delete-everything (the classic Checking Mail
+ * panel).  Zero-initialize for the plain behavior. */
+typedef struct {
+    /* DELE every message after retrieval. */
+    int delete_from_server;
+    /* When leaving mail on the server: also DELE already-fetched messages
+     * whose local arrival is older than this many days (PREF_LMOS_XDAYS;
+     * 0 = keep forever).  Ignored when delete_from_server is set. */
+    int32_t leave_on_server_days;
+    /* Skip (leave unfetched on the server) messages larger than this many
+     * KB (PREF_NO_BIGGIES / big-message limit; 0 = no limit).  Skipped
+     * messages are reconsidered on every later check. */
+    int32_t max_message_k;
+} eudora_pop3_options;
+
+/* eudora_pop3_fetch_ex with the full option set; options may be NULL. */
+int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
+                               const char *user, const char *password,
+                               const char *mbox_path,
+                               const eudora_pop3_options *options,
+                               eudora_progress_fn progress, void *ctx);
 
 /* ---- SMTP -------------------------------------------------------------- */
 

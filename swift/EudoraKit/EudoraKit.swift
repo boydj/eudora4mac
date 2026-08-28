@@ -46,8 +46,9 @@ private func takeStringArray(
 // MARK: - Mailboxes
 
 public enum MessageState: UInt8 {
-    case unread = 1, read = 2, replied = 3, sendable = 6, queued = 7
-    case forwarded = 8, sent = 9, rebuilt = 14
+    case unread = 1, read = 2, replied = 3, redistributed = 4, unsendable = 5
+    case sendable = 6, queued = 7, forwarded = 8, sent = 9, unsent = 10
+    case timed = 11, rebuilt = 14
     case other = 0
 }
 
@@ -56,6 +57,7 @@ public struct MessageSummary {
     public let from: String
     public let subject: String
     public let date: Date
+    public let arrival: Date
     public let state: MessageState
     public let priorityDisplay: Int
     public let spamScore: Int
@@ -91,6 +93,7 @@ public final class Mailbox {
             from: s.from.map { String(cString: $0) } ?? "",
             subject: s.subject.map { String(cString: $0) } ?? "",
             date: Date(timeIntervalSince1970: TimeInterval(s.date_unix)),
+            arrival: Date(timeIntervalSince1970: TimeInterval(s.arrival_unix)),
             state: MessageState(rawValue: s.state) ?? .other,
             priorityDisplay: Int(s.priority_display),
             spamScore: Int(s.spam_score),
@@ -122,6 +125,27 @@ public final class Mailbox {
 
     public func setLabel(_ label: Int, at index: Int) {
         _ = eudora_mailbox_set_label(handle, Int32(index), Int32(label))
+    }
+
+    /// Display priority 1 (highest) through 5 (lowest); 3 is normal.
+    public func setPriority(display: Int, at index: Int) {
+        _ = eudora_mailbox_set_priority(handle, Int32(index), Int32(display))
+    }
+
+    /// Junk score 0-100 (clamped by the engine).
+    public func setSpamScore(_ score: Int, at index: Int) {
+        _ = eudora_mailbox_set_spam_score(handle, Int32(index), Int32(score))
+    }
+
+    /// Replace the summary's subject (the stored message is unchanged).
+    public func setSubject(_ subject: String, at index: Int) {
+        _ = eudora_mailbox_set_subject(handle, Int32(index), subject)
+    }
+
+    /// Index of the message with the given serial number, or nil.
+    public func findBySerial(_ serial: Int) -> Int? {
+        let idx = eudora_mailbox_find_by_serial(handle, Int32(serial))
+        return idx >= 0 ? Int(idx) : nil
     }
 
     /// Appends a complete RFC 822 message (any line-end convention) with a
@@ -569,6 +593,9 @@ public final class Composer {
     @discardableResult public func bcc(_ list: String) -> Composer {
         eudora_composer_bcc(handle, list); return self
     }
+    @discardableResult public func replyTo(_ address: String) -> Composer {
+        eudora_composer_reply_to(handle, address); return self
+    }
     @discardableResult public func subject(_ text: String) -> Composer {
         eudora_composer_subject(handle, text); return self
     }
@@ -623,17 +650,26 @@ private final class FetchProgressBox {
 /// earlier check are recognized by their UIDL and skipped.  Returns the
 /// number of messages fetched (a stopped fetch returns the count stored
 /// before the stop, without throwing).
+///
+/// `maxMessageK` skips (leaves on the server) messages over that many KB;
+/// `leaveOnServerDays` deletes already-fetched messages from the server
+/// once their local arrival is older than that many days (0 = keep forever).
 public func pop3Fetch(host: String, port: UInt16, tls: TLSMode = .none,
                       user: String, password: String,
                       mailboxPath: String, deleteFromServer: Bool = false,
+                      maxMessageK: Int = 0, leaveOnServerDays: Int = 0,
                       progress: FetchProgress? = nil) throws -> Int {
+    var opts = eudora_pop3_options()
+    opts.delete_from_server = deleteFromServer ? 1 : 0
+    opts.leave_on_server_days = Int32(leaveOnServerDays)
+    opts.max_message_k = Int32(maxMessageK)
+
     let n: Int32
     if let progress {
         let box = FetchProgressBox(progress)
         n = withExtendedLifetime(box) {
-            eudora_pop3_fetch_ex(
-                host, port, tls.rawValue, user, password,
-                mailboxPath, deleteFromServer ? 1 : 0,
+            eudora_pop3_fetch_opts(
+                host, port, tls.rawValue, user, password, mailboxPath, &opts,
                 { ctx, stage, done, total in
                     guard let ctx, let stage else { return 0 }
                     let box = Unmanaged<FetchProgressBox>.fromOpaque(ctx)
@@ -644,8 +680,8 @@ public func pop3Fetch(host: String, port: UInt16, tls: TLSMode = .none,
                 Unmanaged.passUnretained(box).toOpaque())
         }
     } else {
-        n = eudora_pop3_fetch(host, port, tls.rawValue, user, password,
-                              mailboxPath, deleteFromServer ? 1 : 0)
+        n = eudora_pop3_fetch_opts(host, port, tls.rawValue, user, password,
+                                   mailboxPath, &opts, nil, nil)
     }
     guard n >= 0 else { throw EudoraError.fromLast() }
     return Int(n)
