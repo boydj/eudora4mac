@@ -8,11 +8,16 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h> // fsync, fileno
+#endif
 
 #include "addressbook/nicknames.hpp"
 #include "compat/hashes.hpp"
@@ -45,6 +50,19 @@ thread_local std::string g_last_error;
 
 void set_error(std::string msg) { g_last_error = std::move(msg); }
 
+// A CR or LF in a value that gets concatenated into a protocol command
+// (a From address, a login credential, an IMAP mailbox name) is a
+// command-injection vector.  Reject rather than silently strip so the
+// caller sees the bad input.
+bool has_control_break(const char *s) {
+    if (!s)
+        return false;
+    for (; *s; ++s)
+        if (*s == '\r' || *s == '\n')
+            return true;
+    return false;
+}
+
 char *dup_string(std::string_view s) {
     char *out = static_cast<char *>(std::malloc(s.size() + 1));
     if (!out)
@@ -74,6 +92,19 @@ std::string read_file_range(const std::filesystem::path &path,
 struct eudora_mailbox {
     TableOfContents toc;
     std::filesystem::path toc_file;
+    // Stable storage for strings returned by eudora_mailbox_summary.  The
+    // summary's from/subject live in toc.sums, a vector that moves its
+    // elements on append/delete; returning c_str() into it would dangle
+    // after the very mutations the header says are safe.  A deque never
+    // invalidates references to existing elements, so copies stashed here
+    // stay valid for the handle's whole life, honoring the contract.
+    // mutable: it is a read cache filled by the const summary accessor.
+    mutable std::deque<std::string> str_pool;
+
+    const char *stash(const std::string &s) const {
+        str_pool.push_back(s);
+        return str_pool.back().c_str();
+    }
 };
 
 struct eudora_message {
@@ -162,8 +193,8 @@ int eudora_mailbox_summary(const eudora_mailbox *mb, int32_t index,
     out->priority_display = static_cast<uint8_t>(s.display_priority());
     out->uid_hash = s.uid_hash;
     out->msg_id_hash = s.msg_id_hash;
-    out->from = s.from.c_str();
-    out->subject = s.subject.c_str();
+    out->from = mb->stash(s.from);
+    out->subject = mb->stash(s.subject);
     out->arrival_unix = mac_to_unix(s.arrival_seconds);
     return 1;
 }
@@ -575,11 +606,35 @@ int32_t eudora_mailbox_append_message(eudora_mailbox *mb, const char *raw,
     }
     std::fseek(out, 0, SEEK_END);
     const std::int64_t start = std::ftell(out);
+    // TOC offsets and lengths are 32-bit (the classic 2 GB mailbox
+    // ceiling); refuse rather than silently truncate the index.
+    const std::int64_t total =
+        static_cast<std::int64_t>(envelope.size() + message.size());
+    if (start < 0 ||
+        start + total > std::numeric_limits<std::int32_t>::max()) {
+        std::fclose(out);
+        set_error("mailbox would exceed 2 GB");
+        return -1;
+    }
     const bool ok =
         std::fwrite(envelope.data(), 1, envelope.size(), out) == envelope.size() &&
         std::fwrite(message.data(), 1, message.size(), out) == message.size();
+    if (ok) {
+        // Get the bytes to disk before the TOC records them, so a crash
+        // can't leave a TOC that points past real data.
+        std::fflush(out);
+#ifndef _WIN32
+        ::fsync(::fileno(out));
+#endif
+    }
     std::fclose(out);
     if (!ok) {
+        // Roll the partial write back to `start`: otherwise the mailbox
+        // grows but no summary covers the tail, and the boxSize check would
+        // later bless the garbage instead of triggering a rebuild.
+        std::error_code tec;
+        std::filesystem::resize_file(
+            mb->toc.mailbox_path, static_cast<std::uintmax_t>(start), tec);
         set_error("cannot write to mailbox");
         return -1;
     }
@@ -613,6 +668,10 @@ int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
                                eudora_progress_fn progress, void *ctx) {
     if (!host || !user || !password || !mbox_path) {
         set_error("missing argument");
+        return -1;
+    }
+    if (has_control_break(user) || has_control_break(password)) {
+        set_error("credentials contain a line break");
         return -1;
     }
     // Untrusted server data drives allocations below; keep any exception
@@ -851,6 +910,11 @@ int32_t eudora_imap_fetch_ex(const char *host, uint16_t port, int tls_mode,
         set_error("missing argument");
         return -1;
     }
+    if (has_control_break(user) || has_control_break(password) ||
+        has_control_break(imap_mailbox)) {
+        set_error("credentials or mailbox name contain a line break");
+        return -1;
+    }
     // Untrusted server data drives allocations below; keep any exception
     // from crossing the C boundary (see the catch at the end).
     try {
@@ -1039,6 +1103,13 @@ int eudora_smtp_send(const char *host, uint16_t port, int tls_mode,
                      const char *message, size_t message_len) {
     if (!host || !from || !recipients || !message) {
         set_error("missing argument");
+        return 601;
+    }
+    // from goes straight into MAIL FROM:<…>; user/password into AUTH.  A
+    // line break in any of them would inject additional SMTP commands.
+    if (has_control_break(from) || has_control_break(user) ||
+        has_control_break(password)) {
+        set_error("sender or credentials contain a line break");
         return 601;
     }
 

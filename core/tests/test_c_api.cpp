@@ -511,6 +511,40 @@ TEST_CASE("C API: MIME parts and binary-safe decode") {
     eudora_message_free(msg);
 }
 
+TEST_CASE("C API: summary strings survive a mutating append") {
+    const fs::path box = temp_dir() / "LifetimeBox";
+    write_file(box, kMailbox);
+    eudora_mailbox *mb = eudora_mailbox_open(box.string().c_str());
+    CHECK(mb != nullptr);
+    if (!mb)
+        return;
+    eudora_summary sum{};
+    CHECK(eudora_mailbox_summary(mb, 0, &sum));
+    // Hold the borrowed pointers, then force TOC growth (the summary vector
+    // may reallocate) — the header promises these stay valid.
+    const char *held_from = sum.from;
+    const char *held_subject = sum.subject;
+    const std::string draft =
+        "From: x@example.com\nSubject: another\n\nbody\n";
+    for (int i = 0; i < 8; ++i)
+        eudora_mailbox_append_message(mb, draft.data(), draft.size(), 0);
+    CHECK_EQ(std::string(held_from), "Alice Wonder");
+    CHECK_EQ(std::string(held_subject), "café plans");
+    eudora_mailbox_close(mb);
+}
+
+TEST_CASE("C API: line breaks in credentials/sender are rejected") {
+    // The guard fires before any connection, so no server is needed.
+    const int32_t p = eudora_pop3_fetch("127.0.0.1", 110, EUDORA_TLS_NONE,
+                                        "user\r\nDELE 1", "pass",
+                                        "/tmp/nope", 0);
+    CHECK_EQ(p, -1);
+    const int s = eudora_smtp_send("127.0.0.1", 25, EUDORA_TLS_NONE, nullptr,
+                                   nullptr, "me@x.com\r\nRCPT TO:<evil@x>",
+                                   "you@x.com", "hi", 2);
+    CHECK(s != 250 && s != 200); // rejected, not sent
+}
+
 TEST_CASE("C API: summary setters and find-by-serial") {
     const fs::path box = temp_dir() / "SetterBox";
     write_file(box, kMailbox + kMailbox);
