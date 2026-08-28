@@ -144,8 +144,10 @@ What it recreates, and from where:
   Attention (alert / sound / Dock badge / open mailbox), Junk Mail
   (threshold, transfer score, empty-after-days), Fonts & Display,
   Labels, and the mail folder location. Stored as `EudoraSettings.json`
-  in the mail folder (move to Keychain for a production build); older
-  settings files load unchanged — decoding is tolerant of missing keys.
+  in the mail folder; **account passwords live in the macOS Keychain**
+  (never in the JSON), and a legacy settings file's inline password is
+  migrated to the Keychain on the next save.  Older settings files load
+  unchanged — decoding is tolerant of missing keys.
 - **Mail automation** — auto-check on the configured interval; after
   each check the classic pipeline runs: incoming filters, the junk sweep
   (score ≥ threshold moves to Junk), junk aging (old junk to Trash),

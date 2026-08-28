@@ -5,8 +5,10 @@
 //
 // The legacy app kept these in the resource-fork "Eudora Settings" file;
 // the modern app stores them as JSON in the mail folder
-// ("EudoraSettings.json").  Passwords live in the same file for now; a
-// production build should move them to the Keychain.
+// ("EudoraSettings.json").  Passwords are NOT written to that file — they
+// live in the macOS Keychain (see Keychain.swift and AppModel's password
+// sync).  A legacy `password` key is still *decoded* so an older settings
+// file migrates its password to the Keychain on the next save.
 //
 // CODABLE CONVENTION (important): these structs grow over time, and a
 // synthesized decoder throws on any missing key — which would silently
@@ -119,6 +121,33 @@ struct Personality: Codable, Identifiable, Equatable {
         serverDeleteOnTrashEmpty = c.value(.serverDeleteOnTrashEmpty, default: false)
         useSignature = c.value(.useSignature, default: false)
         signatureName = c.value(.signatureName, default: "")
+    }
+
+    // Custom encode so `password` is never written to the settings JSON; it
+    // is kept in the Keychain instead.  Everything else round-trips as usual.
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(realName, forKey: .realName)
+        try c.encode(emailAddress, forKey: .emailAddress)
+        try c.encode(username, forKey: .username)
+        // .password intentionally omitted.
+        try c.encode(popHost, forKey: .popHost)
+        try c.encode(popPort, forKey: .popPort)
+        try c.encode(popSecurity, forKey: .popSecurity)
+        try c.encode(leaveOnServer, forKey: .leaveOnServer)
+        try c.encode(smtpHost, forKey: .smtpHost)
+        try c.encode(smtpPort, forKey: .smtpPort)
+        try c.encode(smtpSecurity, forKey: .smtpSecurity)
+        try c.encode(accountType, forKey: .accountType)
+        try c.encode(includeInChecks, forKey: .includeInChecks)
+        try c.encode(leaveOnServerDays, forKey: .leaveOnServerDays)
+        try c.encode(skipBigMessages, forKey: .skipBigMessages)
+        try c.encode(bigMessageLimitK, forKey: .bigMessageLimitK)
+        try c.encode(serverDeleteOnTrashEmpty, forKey: .serverDeleteOnTrashEmpty)
+        try c.encode(useSignature, forKey: .useSignature)
+        try c.encode(signatureName, forKey: .signatureName)
     }
 }
 

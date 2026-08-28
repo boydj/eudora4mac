@@ -44,6 +44,7 @@ final class AppModel: ObservableObject {
         bootstrapMailFolder()
         reloadMailboxes()
         settings = EudoraSettings.load(from: settingsURL)
+        hydratePasswords()
         refreshAutoCheck()
         updateDockBadge()
     }
@@ -116,6 +117,7 @@ final class AppModel: ObservableObject {
     init() {
         bootstrapMailFolder()
         settings = EudoraSettings.load(from: settingsURL)
+        hydratePasswords()
         reloadMailboxes()
         refreshAutoCheck()
         updateDockBadge()
@@ -1072,9 +1074,35 @@ final class AppModel: ObservableObject {
     }
 
     func saveSettings() {
+        // Passwords go to the Keychain; the JSON on disk never carries them
+        // (Personality.encode omits the field).
+        syncPasswordsToKeychain()
         settings.save(to: settingsURL)
         refreshAutoCheck()
         updateDockBadge()
+    }
+
+    // MARK: account passwords (Keychain)
+
+    /// After loading settings, fill each personality's password from the
+    /// Keychain; when the Keychain has none, keep whatever a legacy settings
+    /// file decoded so it migrates to the Keychain on the next save.
+    private func hydratePasswords() {
+        for i in settings.personalities.indices {
+            let stored = Keychain.get(settings.personalities[i].id.uuidString)
+            if !stored.isEmpty {
+                settings.personalities[i].password = stored
+            }
+        }
+    }
+
+    /// Write each personality's current password to the Keychain (an empty
+    /// password removes the item).  Entries for personalities the user later
+    /// deletes are orphaned but harmless — keyed by a now-unused UUID.
+    private func syncPasswordsToKeychain() {
+        for p in settings.personalities {
+            Keychain.set(p.password, for: p.id.uuidString)
+        }
     }
 }
 

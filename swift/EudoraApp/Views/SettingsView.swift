@@ -146,6 +146,8 @@ struct SettingsView: View {
                            model.settings.personalities.count > 1,
                            let i = model.settings.personalities.firstIndex(where: { $0.id == id }) {
                             model.settings.personalities.remove(at: i)
+                            // Drop the deleted account's stored password too.
+                            Keychain.remove(id.uuidString)
                             if model.settings.dominantIndex >= model.settings.personalities.count {
                                 model.settings.dominantIndex = 0
                             }
