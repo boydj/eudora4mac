@@ -142,6 +142,36 @@ int eudora_smtp_send(const char *host, uint16_t port, int tls_mode,
                      const char *from, const char *recipients,
                      const char *message, size_t message_len);
 
+/* ---- message composition ----------------------------------------------- */
+
+typedef struct eudora_composer eudora_composer;
+
+eudora_composer *eudora_composer_new(void);
+void eudora_composer_free(eudora_composer *c);
+
+void eudora_composer_from(eudora_composer *c, const char *name,
+                          const char *address);
+void eudora_composer_to(eudora_composer *c, const char *address_list);
+void eudora_composer_cc(eudora_composer *c, const char *address_list);
+void eudora_composer_bcc(eudora_composer *c, const char *address_list);
+void eudora_composer_reply_to(eudora_composer *c, const char *address);
+void eudora_composer_subject(eudora_composer *c, const char *utf8_subject);
+void eudora_composer_body(eudora_composer *c, const char *utf8_body);
+void eudora_composer_header(eudora_composer *c, const char *name,
+                            const char *value);
+void eudora_composer_priority(eudora_composer *c, int display_priority);
+/* content_type/filename may be NULL to guess/use the path's name. */
+void eudora_composer_attach(eudora_composer *c, const char *path,
+                            const char *content_type, const char *filename);
+
+/* The full RFC 822 message (CRLF), ready for eudora_smtp_send; NULL if an
+ * attachment can't be read.  Free with eudora_string_free. */
+char *eudora_composer_build(const eudora_composer *c);
+/* Envelope pieces for eudora_smtp_send. */
+char *eudora_composer_sender(const eudora_composer *c);
+/* Comma-joined bare recipient addresses (to+cc+bcc). */
+char *eudora_composer_recipients(const eudora_composer *c);
+
 /* ---- address book (Eudora Nicknames) ----------------------------------- */
 
 typedef struct eudora_addressbook eudora_addressbook;

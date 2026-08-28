@@ -13,6 +13,7 @@
 #include "filters/filter_file.hpp"
 #include "filters/match_engine.hpp"
 #include "mail/address_parser.hpp"
+#include "mail/composer.hpp"
 #include "mail/header_parser.hpp"
 #include "mail/mime_codec.hpp"
 #include "mailstore/compaction.hpp"
@@ -590,6 +591,95 @@ int eudora_smtp_send(const char *host, uint16_t port, int tls_mode,
     const int code = smtp.last_code();
     smtp.quit();
     return code;
+}
+
+/* ---- message composition ----------------------------------------------- */
+
+eudora_composer *eudora_composer_new(void) {
+    return reinterpret_cast<eudora_composer *>(new MessageComposer());
+}
+
+void eudora_composer_free(eudora_composer *c) {
+    delete reinterpret_cast<MessageComposer *>(c);
+}
+
+static MessageComposer *comp_mut(eudora_composer *c) {
+    return reinterpret_cast<MessageComposer *>(c);
+}
+static const MessageComposer *comp(const eudora_composer *c) {
+    return reinterpret_cast<const MessageComposer *>(c);
+}
+
+void eudora_composer_from(eudora_composer *c, const char *name,
+                          const char *address) {
+    if (c && address)
+        comp_mut(c)->from(name ? name : "", address);
+}
+void eudora_composer_to(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->to(v);
+}
+void eudora_composer_cc(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->cc(v);
+}
+void eudora_composer_bcc(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->bcc(v);
+}
+void eudora_composer_reply_to(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->reply_to(v);
+}
+void eudora_composer_subject(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->subject(v);
+}
+void eudora_composer_body(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->body(v);
+}
+void eudora_composer_header(eudora_composer *c, const char *name,
+                            const char *value) {
+    if (c && name && value)
+        comp_mut(c)->header(name, value);
+}
+void eudora_composer_priority(eudora_composer *c, int p) {
+    if (c)
+        comp_mut(c)->priority(p);
+}
+void eudora_composer_attach(eudora_composer *c, const char *path,
+                            const char *content_type, const char *filename) {
+    if (c && path)
+        comp_mut(c)->attach({path, content_type ? content_type : "",
+                         filename ? filename : ""});
+}
+
+char *eudora_composer_build(const eudora_composer *c) {
+    if (!c)
+        return nullptr;
+    auto built = comp(c)->build();
+    if (!built) {
+        set_error("cannot read attachment");
+        return nullptr;
+    }
+    return dup_string(*built);
+}
+
+char *eudora_composer_sender(const eudora_composer *c) {
+    return c ? dup_string(comp(c)->sender()) : nullptr;
+}
+
+char *eudora_composer_recipients(const eudora_composer *c) {
+    if (!c)
+        return nullptr;
+    std::string joined;
+    for (const auto &r : comp(c)->recipients()) {
+        if (!joined.empty())
+            joined += ", ";
+        joined += r;
+    }
+    return dup_string(joined);
 }
 
 /* ---- address book ------------------------------------------------------ */

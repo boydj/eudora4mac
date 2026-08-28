@@ -62,6 +62,7 @@ target_sources(eudora_core PRIVATE
   mail/lex822.cpp
   mail/header_parser.cpp
   mail/address_parser.cpp
+  mail/composer.cpp
   net/line_receiver.cpp
   net/posix_transport.cpp
   protocols/md5.c

@@ -122,6 +122,36 @@ std::string decode_q_encoding(std::string_view text) {
     return out;
 }
 
+std::string encode_rfc2047(std::string_view text) {
+    bool ascii = true;
+    for (unsigned char c : text)
+        if (c >= 0x80 || c == '\r' || c == '\n') {
+            ascii = false;
+            break;
+        }
+    if (ascii)
+        return std::string(text);
+
+    // Chunk at UTF-8 boundaries; 45 raw bytes -> 60 base64 chars, keeping
+    // each "=?utf-8?B?...?=" word under the 75-character limit.
+    std::string out;
+    std::size_t i = 0;
+    while (i < text.size()) {
+        std::size_t take = std::min<std::size_t>(45, text.size() - i);
+        // Don't split inside a UTF-8 sequence.
+        while (take > 1 && i + take < text.size() &&
+               (static_cast<unsigned char>(text[i + take]) & 0xC0) == 0x80)
+            --take;
+        if (!out.empty())
+            out += ' '; // whitespace between encoded words decodes to nothing
+        out += "=?utf-8?B?";
+        out += base64_encode(text.substr(i, take));
+        out += "?=";
+        i += take;
+    }
+    return out;
+}
+
 std::string decode_rfc2047(std::string_view header) {
     std::string out;
     std::size_t i = 0;

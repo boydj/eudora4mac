@@ -20,4 +20,9 @@ std::string decode_rfc2047(std::string_view header);
 // The "Q" encoding decoder ('_' means space) — PseudoQP.
 std::string decode_q_encoding(std::string_view text);
 
+// Encode a header value for transmission (Encode1342's modern equivalent):
+// pure ASCII passes through; anything else becomes =?utf-8?B?...?= words
+// split on UTF-8 boundaries to keep each encoded word within RFC limits.
+std::string encode_rfc2047(std::string_view text);
+
 } // namespace eudora
