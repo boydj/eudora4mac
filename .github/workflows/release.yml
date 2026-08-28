@@ -1,5 +1,15 @@
 # Release: on a v* tag, build the app, package Eudora.app, and attach
 # the zip to a GitHub Release.
+#
+# Signing: if the Developer ID secrets are configured for the repository the
+# app is signed with a hardened runtime and notarized; otherwise it falls
+# back to an ad-hoc signature (runnable locally, not distributable).  Set:
+#   MACOS_CERT_P12 / MACOS_CERT_PASSWORD  Developer ID Application cert (.p12,
+#                                         base64) and its password
+#   MACOS_SIGN_IDENTITY                   "Developer ID Application: … (TEAM)"
+#   MACOS_NOTARIZE                        "1" to notarize + staple
+#   AC_API_KEY_ID / AC_API_ISSUER_ID / AC_API_KEY_BASE64
+#                                         App Store Connect API key for notary
 
 name: Release
 
@@ -15,14 +25,36 @@ jobs:
   release:
     name: Build and release Eudora.app
     runs-on: macos-latest
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
     steps:
       - uses: actions/checkout@v5
       - name: Build (release)
         run: swift build -c release
+
+      # Only runs when a Developer ID cert secret is configured.
+      - name: Import Developer ID certificate
+        if: env.MACOS_CERT_P12 != ''
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERT_P12 }}
+          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+
       - name: Package Eudora.app
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARIZE: ${{ secrets.MACOS_NOTARIZE }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+          AC_API_KEY_BASE64: ${{ secrets.AC_API_KEY_BASE64 }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          if [[ -n "${AC_API_KEY_BASE64:-}" ]]; then
+            echo "$AC_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/ac_api_key.p8"
+            export AC_API_KEY_PATH="$RUNNER_TEMP/ac_api_key.p8"
+          fi
           bash packaging/make_app_bundle.sh .build/release dist "$VERSION"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

@@ -7,10 +7,23 @@
 #   version       CFBundleShortVersionString (default 0.0.0-dev)
 #
 # Run from the repository root, after `swift build -c release`.
-# The bundle is ad-hoc signed; distributing outside your own machines
-# properly needs a Developer ID certificate + notarization (slot a real
-# `codesign --sign "Developer ID Application: …"` and `notarytool submit`
-# in below where the ad-hoc signing happens).
+#
+# Signing: by default the bundle is ad-hoc signed (enough to run locally;
+# right-click > Open the first time on another machine).  For real
+# distribution set these environment variables and the script will sign with
+# a Developer ID and notarize:
+#
+#   MACOS_SIGN_IDENTITY   e.g. "Developer ID Application: Your Name (TEAMID)"
+#                         The matching cert+key must be in the login keychain.
+#   MACOS_NOTARIZE=1      after signing, submit to Apple's notary service and
+#                         staple the ticket.  Requires either:
+#                           AC_NOTARY_PROFILE   a `notarytool store-credentials`
+#                                               keychain profile name, or
+#                           AC_API_KEY_ID + AC_API_ISSUER_ID + AC_API_KEY_PATH
+#                                               an App Store Connect API key.
+#
+# All of these are secrets we cannot ship; the CI release job wires them from
+# repository secrets when present and otherwise falls back to ad-hoc signing.
 
 set -euo pipefail
 
@@ -46,13 +59,42 @@ sed "s/@VERSION@/$VERSION/g" "$REPO_ROOT/packaging/Info.plist.in" \
     > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-# Ad-hoc signature: enough to run locally (right-click > Open the first
-# time on another machine, since it is not notarized).
-codesign --force --deep --sign - "$APP"
+# Signature.  With a Developer ID identity, hardened-runtime sign (required
+# for notarization); otherwise ad-hoc sign so it at least runs locally.
+if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
+    echo "signing with Developer ID: $MACOS_SIGN_IDENTITY"
+    codesign --force --deep --options runtime --timestamp \
+             --sign "$MACOS_SIGN_IDENTITY" "$APP"
+else
+    echo "ad-hoc signing (set MACOS_SIGN_IDENTITY for a distributable build)"
+    codesign --force --deep --sign - "$APP"
+fi
 
 ZIP="$OUT_DIR/Eudora-$VERSION-macos-arm64.zip"
 rm -f "$ZIP"
 ditto -c -k --keepParent "$APP" "$ZIP"
+
+# Notarization (only meaningful with a real Developer ID signature).
+if [[ "${MACOS_NOTARIZE:-}" == "1" && -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
+    echo "submitting $ZIP for notarization…"
+    if [[ -n "${AC_NOTARY_PROFILE:-}" ]]; then
+        xcrun notarytool submit "$ZIP" \
+            --keychain-profile "$AC_NOTARY_PROFILE" --wait
+    elif [[ -n "${AC_API_KEY_ID:-}" && -n "${AC_API_ISSUER_ID:-}" \
+            && -n "${AC_API_KEY_PATH:-}" ]]; then
+        xcrun notarytool submit "$ZIP" \
+            --key "$AC_API_KEY_PATH" --key-id "$AC_API_KEY_ID" \
+            --issuer "$AC_API_ISSUER_ID" --wait
+    else
+        echo "error: MACOS_NOTARIZE=1 but no notary credentials provided" >&2
+        exit 1
+    fi
+    # Staple the ticket into the .app, then re-zip so the download carries it.
+    xcrun stapler staple "$APP"
+    rm -f "$ZIP"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+    echo "notarized and stapled"
+fi
 
 echo "built $APP"
 echo "zipped $ZIP"
