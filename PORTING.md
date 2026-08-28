@@ -46,6 +46,16 @@ target from it for a bundled release build; set `CFBundleIconFile` to the
 classic `Eudora.icns`, which the app also carries as a package resource
 and applies at runtime — the Dock shows the original icon either way).
 
+The bundled `swift/EudoraApp/Resources/Eudora.icns` is regenerated from
+the original 1990s art by [`tools/make_icon.py`](tools/make_icon.py): the
+legacy icon *source* directories (`Icons/`, `Eudora60Icons/`,
+`new_icons/`) lost their resource forks in the archive import, so the
+compiled icns inside the legacy app bundle is the only surviving art.
+The tool decodes its classic elements (`it32`/`t8mk` 128 px on down),
+bicubic-upscales the 128 px master for the Retina slots (256/512/1024),
+and emits a modern PNG-element icns.  The legacy file itself is left
+untouched.
+
 What it recreates, and from where:
 
 - **The mailbox window** (`MailboxPane`) — the classic summary table with
