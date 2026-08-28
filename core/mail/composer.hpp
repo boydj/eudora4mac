@@ -31,6 +31,10 @@ public:
     MessageComposer &reply_to(std::string address);
     MessageComposer &subject(std::string text); // UTF-8; RFC2047 on the wire
     MessageComposer &body(std::string utf8_text);
+    // Styled alternative (the rich composer): when set, build() emits a
+    // multipart/alternative with the plain body first and this text/html
+    // second, so plain-text readers still see body().  UTF-8.
+    MessageComposer &html_body(std::string utf8_html);
     MessageComposer &header(std::string name, std::string value); // extra
     MessageComposer &attach(Attachment att);
     // X-Priority: 1..5 (Prior2Display scale); 0/3 omit the header.
@@ -49,7 +53,7 @@ public:
 private:
     std::string from_name_, from_addr_;
     std::string to_, cc_, bcc_, reply_to_;
-    std::string subject_, body_;
+    std::string subject_, body_, html_body_;
     std::vector<std::pair<std::string, std::string>> extra_;
     std::vector<Attachment> attachments_;
     int priority_ = 0;

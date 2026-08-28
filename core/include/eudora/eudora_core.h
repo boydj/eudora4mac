@@ -288,6 +288,9 @@ void eudora_composer_bcc(eudora_composer *c, const char *address_list);
 void eudora_composer_reply_to(eudora_composer *c, const char *address);
 void eudora_composer_subject(eudora_composer *c, const char *utf8_subject);
 void eudora_composer_body(eudora_composer *c, const char *utf8_body);
+/* Styled alternative: build() emits multipart/alternative (plain then this
+ * text/html) so plain readers still get utf8_body.  Pass "" to omit. */
+void eudora_composer_html_body(eudora_composer *c, const char *utf8_html);
 void eudora_composer_header(eudora_composer *c, const char *name,
                             const char *value);
 void eudora_composer_priority(eudora_composer *c, int display_priority);
@@ -322,6 +325,12 @@ const char *eudora_addressbook_notes(const eudora_addressbook *ab, int32_t i);
 int eudora_addressbook_set(eudora_addressbook *ab, const char *name,
                            const char *addresses, const char *notes);
 int eudora_addressbook_remove(eudora_addressbook *ab, const char *name);
+
+/* Import contacts from a delimited text ("Name <addr>", "name<TAB>addr",
+ * "name,addr", or bare "addr", one per line) and merge them in.  When
+ * overwrite is 0 existing nicknames are kept.  Returns the number merged. */
+int32_t eudora_addressbook_import_contacts(eudora_addressbook *ab,
+                                           const char *text, int overwrite);
 
 /* Recursively expand nicknames in an address list; NULL-terminated array,
  * free with eudora_addresses_free. */

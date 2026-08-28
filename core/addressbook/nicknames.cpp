@@ -203,6 +203,89 @@ bool AddressBook::remove(std::string_view name) {
     return false;
 }
 
+namespace {
+
+// "Display Name <addr>" → {name, addr}; otherwise {"", token}.
+std::pair<std::string, std::string> split_named_address(std::string_view s) {
+    const std::size_t lt = s.find('<');
+    const std::size_t gt = s.rfind('>');
+    if (lt != std::string_view::npos && gt != std::string_view::npos && gt > lt) {
+        std::string name(trim(s.substr(0, lt)));
+        // Strip surrounding quotes on the display name.
+        if (name.size() >= 2 && name.front() == '"' && name.back() == '"')
+            name = name.substr(1, name.size() - 2);
+        return {name, std::string(trim(s.substr(lt + 1, gt - lt - 1)))};
+    }
+    return {"", std::string(trim(s))};
+}
+
+// Nickname from a display name (spaces kept — parse() quotes on save) or,
+// failing that, the address' local part.
+std::string derive_nickname(std::string_view display, std::string_view addr) {
+    std::string_view d = trim(display);
+    if (!d.empty())
+        return std::string(d);
+    std::string_view a = trim(addr);
+    const std::size_t at = a.find('@');
+    return std::string(at == std::string_view::npos ? a : a.substr(0, at));
+}
+
+} // namespace
+
+std::vector<Nickname> AddressBook::import_contacts(std::string_view text) {
+    std::vector<Nickname> out;
+    for (const auto &line : logical_lines(text)) {
+        std::string_view l = trim(line);
+        if (l.empty() || l.front() == '#')
+            continue;
+
+        std::string name, addr, notes;
+        // Prefer an explicit "<addr>"; else split on the first tab or comma.
+        if (l.find('<') != std::string_view::npos) {
+            auto [n, a] = split_named_address(l);
+            name = n;
+            addr = a;
+        } else {
+            const std::size_t sep = l.find_first_of("\t,");
+            if (sep == std::string_view::npos) {
+                addr = std::string(l); // bare address
+            } else {
+                name = std::string(trim(l.substr(0, sep)));
+                std::string_view rest = trim(l.substr(sep + 1));
+                const std::size_t sep2 = rest.find_first_of("\t,");
+                if (sep2 == std::string_view::npos) {
+                    addr = std::string(rest);
+                } else {
+                    addr = std::string(trim(rest.substr(0, sep2)));
+                    notes = std::string(trim(rest.substr(sep2 + 1)));
+                }
+            }
+        }
+        if (addr.empty())
+            continue;
+        Nickname nick;
+        nick.name = derive_nickname(name, addr);
+        nick.addresses = addr;
+        nick.notes = notes;
+        nick.group = false;
+        if (!nick.name.empty())
+            out.push_back(std::move(nick));
+    }
+    return out;
+}
+
+int AddressBook::merge(const std::vector<Nickname> &incoming, bool overwrite) {
+    int changed = 0;
+    for (const auto &nick : incoming) {
+        const Nickname *existing = find(nick.name);
+        if (existing && !overwrite)
+            continue;
+        set(nick);
+        ++changed;
+    }
+    return changed;
+}
+
 std::vector<std::string> AddressBook::expand(std::string_view list) const {
     std::vector<std::string> out;
     // Case-normalized names currently being expanded (cycle protection).

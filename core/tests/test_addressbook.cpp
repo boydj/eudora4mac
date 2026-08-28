@@ -83,6 +83,49 @@ TEST_CASE("address book round trip and membership") {
     CHECK(!book.contains_address("stranger@nowhere.example"));
 }
 
+TEST_CASE("address book imports mixed contact formats and merges") {
+    const std::string contacts =
+        "Alice Wonder <alice@example.com>\r"
+        "bob\tbob@example.org\tcolleague\r"
+        "carol,carol@example.net\r"
+        "dave@example.io\r"          // bare address -> local part nickname
+        "# ignore me\r"
+        "\r";                        // blank line skipped
+    const auto parsed = AddressBook::import_contacts(contacts);
+    CHECK_EQ(parsed.size(), 4u);
+    if (parsed.size() == 4) {
+        CHECK_EQ(parsed[0].name, "Alice Wonder");
+        CHECK_EQ(parsed[0].addresses, "alice@example.com");
+        CHECK_EQ(parsed[1].name, "bob");
+        CHECK_EQ(parsed[1].notes, "colleague");
+        CHECK_EQ(parsed[2].addresses, "carol@example.net");
+        CHECK_EQ(parsed[3].name, "dave"); // derived from local part
+    }
+
+    AddressBook book;
+    book.set({"bob", "old-bob@example.org", "", false});
+    // Non-overwriting merge keeps the existing bob, adds the other three.
+    const int added = book.merge(parsed, /*overwrite=*/false);
+    CHECK_EQ(added, 3);
+    CHECK_EQ(book.find("bob")->addresses, "old-bob@example.org");
+    CHECK(book.find("Alice Wonder") != nullptr);
+    // Overwriting merge replaces bob.
+    CHECK_EQ(book.merge(parsed, /*overwrite=*/true), 4);
+    CHECK_EQ(book.find("bob")->addresses, "bob@example.org");
+}
+
+TEST_CASE("C API contact import merges into a book") {
+    eudora_addressbook *ab = eudora_addressbook_parse("alias bob keep@x.y\r");
+    CHECK(ab != nullptr);
+    if (!ab)
+        return;
+    const char *contacts = "Alice <a@x.y>\nbob\tnew@x.y\n";
+    CHECK_EQ(eudora_addressbook_import_contacts(ab, contacts, /*overwrite=*/0), 1);
+    CHECK_EQ(eudora_addressbook_count(ab), 2); // alice added, bob kept
+    CHECK_EQ(eudora_addressbook_import_contacts(ab, contacts, /*overwrite=*/1), 2);
+    eudora_addressbook_free(ab);
+}
+
 TEST_CASE("C API address book + filters intersectsFile") {
     eudora_addressbook *ab = eudora_addressbook_parse(kBook.c_str());
     CHECK(ab != nullptr);

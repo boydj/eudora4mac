@@ -60,6 +60,51 @@ std::string fold_address_header(const std::string &name,
     return out;
 }
 
+// A rendered MIME text part: its own headers (Content-Type + CTE) and its
+// transfer-encoded body (CRLF-terminated).
+struct TextPart {
+    std::string headers;
+    std::string body;
+};
+
+// Forward decl (defined after normalize_newlines).
+std::string normalize_newlines(std::string_view text);
+
+// Render one text/<subtype> part, choosing us-ascii/7bit when the text is
+// clean ASCII and utf-8/quoted-printable otherwise (BuildBoundary +
+// Encode1342's modern shape).  Used for both text/plain and text/html.
+TextPart render_text_part(const char *subtype, const std::string &text) {
+    const std::string crlf = normalize_newlines(text);
+    const bool ascii = is_ascii_clean(crlf);
+    TextPart part;
+    if (ascii) {
+        part.headers = std::string("Content-Type: text/") + subtype +
+                       "; charset=\"us-ascii\"" + kCrlf +
+                       "Content-Transfer-Encoding: 7bit" + kCrlf;
+        part.body = crlf;
+    } else {
+        part.headers = std::string("Content-Type: text/") + subtype +
+                       "; charset=\"utf-8\"" + kCrlf +
+                       "Content-Transfer-Encoding: quoted-printable" + kCrlf;
+        // The QP encoder works on CR-terminated text with CR newlines out.
+        std::string cr_body;
+        cr_body.reserve(crlf.size());
+        for (std::size_t i = 0; i < crlf.size(); ++i) {
+            if (crlf[i] == '\r' && i + 1 < crlf.size() && crlf[i + 1] == '\n') {
+                cr_body += '\r';
+                ++i;
+            } else {
+                cr_body += crlf[i];
+            }
+        }
+        part.body = normalize_newlines(qp_encode(cr_body, "\r"));
+    }
+    if (!part.body.empty() &&
+        part.body.compare(part.body.size() - 2, 2, kCrlf) != 0)
+        part.body += kCrlf;
+    return part;
+}
+
 // Body text normalized to CRLF.
 std::string normalize_newlines(std::string_view text) {
     std::string out;
@@ -168,6 +213,10 @@ MessageComposer &MessageComposer::body(std::string v) {
     body_ = std::move(v);
     return *this;
 }
+MessageComposer &MessageComposer::html_body(std::string v) {
+    html_body_ = std::move(v);
+    return *this;
+}
 MessageComposer &MessageComposer::header(std::string name, std::string value) {
     extra_.emplace_back(std::move(name), std::move(value));
     return *this;
@@ -240,46 +289,33 @@ std::optional<std::string> MessageComposer::build() const {
     for (const auto &[name, value] : extra_)
         msg += name + ": " + value + kCrlf;
 
-    // Body part.
-    const std::string body_crlf = normalize_newlines(body_);
-    const bool body_ascii = is_ascii_clean(body_crlf);
-    std::string body_part_headers;
-    std::string body_part;
-    if (body_ascii) {
-        body_part_headers = "Content-Type: text/plain; charset=\"us-ascii\"";
-        body_part_headers += kCrlf;
-        body_part_headers += "Content-Transfer-Encoding: 7bit";
-        body_part_headers += kCrlf;
-        body_part = body_crlf;
+    // The text content: a bare text/plain part, or — when a styled
+    // alternative is set — a multipart/alternative wrapping text/plain then
+    // text/html (least-featured first, per RFC 2046).  render_text_part
+    // shares the ASCII-vs-QP logic between them.
+    const TextPart plain = render_text_part("plain", body_);
+    TextPart content;      // the part placed at top level or inside mixed
+    if (html_body_.empty()) {
+        content = plain;
     } else {
-        body_part_headers = "Content-Type: text/plain; charset=\"utf-8\"";
-        body_part_headers += kCrlf;
-        body_part_headers += "Content-Transfer-Encoding: quoted-printable";
-        body_part_headers += kCrlf;
-        // The QP encoder works on CR-terminated text with CR newlines out.
-        std::string cr_body;
-        cr_body.reserve(body_crlf.size());
-        for (std::size_t i = 0; i < body_crlf.size(); ++i) {
-            if (body_crlf[i] == '\r' && i + 1 < body_crlf.size() &&
-                body_crlf[i + 1] == '\n') {
-                cr_body += '\r';
-                ++i;
-            } else {
-                cr_body += body_crlf[i];
-            }
-        }
-        std::string qp = qp_encode(cr_body, "\r");
-        // Back to CRLF for the wire.
-        body_part = normalize_newlines(qp);
+        const TextPart html = render_text_part("html", html_body_);
+        const std::string alt_boundary =
+            "=====================_alt_" +
+            std::to_string(kr_hash(body_ + html_body_)) + "==_";
+        content.headers = "Content-Type: multipart/alternative; boundary=\"" +
+                          alt_boundary + "\"" + kCrlf;
+        std::string &alt = content.body;
+        alt += "--" + alt_boundary + kCrlf;
+        alt += plain.headers + kCrlf + plain.body;
+        alt += "--" + alt_boundary + kCrlf;
+        alt += html.headers + kCrlf + html.body;
+        alt += "--" + alt_boundary + "--" + kCrlf;
     }
-    if (!body_part.empty() &&
-        body_part.compare(body_part.size() - 2, 2, kCrlf) != 0)
-        body_part += kCrlf;
 
     if (attachments_.empty()) {
-        msg += body_part_headers;
+        msg += content.headers;
         msg += kCrlf;
-        msg += body_part;
+        msg += content.body;
         return msg;
     }
 
@@ -292,9 +328,9 @@ std::optional<std::string> MessageComposer::build() const {
     msg += "Content-Type: multipart/mixed; boundary=\"" + boundary + "\"" + kCrlf;
     msg += kCrlf;
     msg += "--" + boundary + kCrlf;
-    msg += body_part_headers;
+    msg += content.headers;
     msg += kCrlf;
-    msg += body_part;
+    msg += content.body;
 
     for (const auto &att : attachments_) {
         std::ifstream f(att.path, std::ios::binary);

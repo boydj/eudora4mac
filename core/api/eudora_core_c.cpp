@@ -1470,6 +1470,10 @@ void eudora_composer_body(eudora_composer *c, const char *v) {
     if (c && v)
         comp_mut(c)->body(v);
 }
+void eudora_composer_html_body(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->html_body(v);
+}
 void eudora_composer_header(eudora_composer *c, const char *name,
                             const char *value) {
     if (c && name && value)
@@ -1585,6 +1589,14 @@ int eudora_addressbook_remove(eudora_addressbook *ab, const char *name) {
     if (!ab || !name)
         return 0;
     return ab->book.remove(name) ? 1 : 0;
+}
+
+int32_t eudora_addressbook_import_contacts(eudora_addressbook *ab,
+                                           const char *text, int overwrite) {
+    if (!ab || !text)
+        return 0;
+    const auto parsed = AddressBook::import_contacts(text);
+    return ab->book.merge(parsed, overwrite != 0);
 }
 
 char **eudora_addressbook_expand(const eudora_addressbook *ab,

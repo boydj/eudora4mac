@@ -42,6 +42,18 @@ public:
     void set(Nickname nick);
     bool remove(std::string_view name);
 
+    // Import contacts from a delimited text (the classic Import Contacts):
+    // one entry per line as "Display Name <addr>", "name<TAB>addr[<TAB>notes]",
+    // "name,addr[,notes]", or a bare "addr".  A nickname is derived from the
+    // display name (else the address' local part); blank/comment (#) lines are
+    // skipped.  Returns the parsed nicknames without merging.
+    static std::vector<Nickname> import_contacts(std::string_view text);
+
+    // Merge another book's nicknames in.  When overwrite is false, an
+    // existing nickname of the same name is kept; otherwise it is replaced.
+    // Returns the number of nicknames added or replaced.
+    int merge(const std::vector<Nickname> &incoming, bool overwrite);
+
     // ExpandAliases (nickexp.c): resolve an address list, replacing tokens
     // that name nicknames with their addresses, recursively, with cycle
     // protection.  Unknown tokens pass through.

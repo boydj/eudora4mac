@@ -715,6 +715,11 @@ public final class Composer {
     @discardableResult public func body(_ text: String) -> Composer {
         eudora_composer_body(handle, text); return self
     }
+    /// Styled alternative body (text/html); the message becomes
+    /// multipart/alternative so plain-text readers still see `body`.
+    @discardableResult public func htmlBody(_ html: String) -> Composer {
+        eudora_composer_html_body(handle, html); return self
+    }
     @discardableResult public func header(_ name: String, _ value: String) -> Composer {
         eudora_composer_header(handle, name, value); return self
     }

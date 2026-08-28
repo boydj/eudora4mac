@@ -111,6 +111,72 @@ TEST_CASE("composer builds multipart with attachment that round trips") {
     CHECK_EQ(decoded, payload);
 }
 
+TEST_CASE("composer builds multipart/alternative for a styled body") {
+    MessageComposer c;
+    c.from("", "a@b.c").to("d@e.f").subject("styled")
+        .body("plain version\n")
+        .html_body("<html><body><b>styled</b> version</body></html>\n");
+    auto built = c.build();
+    CHECK(built.has_value());
+    if (!built)
+        return;
+
+    const auto parts = split_message(*built);
+    const HeaderSet hs = HeaderSet::parse(parts.header_block);
+    CHECK_EQ(hs.content_type(), "multipart");
+    CHECK_EQ(hs.content_subtype(), "alternative");
+    const std::string boundary = hs.boundary();
+    CHECK(!boundary.empty());
+
+    // Two parts: text/plain then text/html, in that order.
+    const std::string marker = "--" + boundary;
+    const auto p1 = built->find(marker);
+    const auto p2 = built->find(marker, p1 + marker.size());
+    const auto p3 = built->find(marker, p2 + marker.size());
+    CHECK(p1 != std::string::npos);
+    CHECK(p2 != std::string::npos);
+    CHECK(p3 != std::string::npos);
+    if (p3 == std::string::npos)
+        return;
+    const std::string plain =
+        built->substr(p1 + marker.size() + 2, p2 - p1 - marker.size() - 2);
+    const std::string html =
+        built->substr(p2 + marker.size() + 2, p3 - p2 - marker.size() - 2);
+    const HeaderSet ph = HeaderSet::parse(split_message(plain).header_block);
+    const HeaderSet hh = HeaderSet::parse(split_message(html).header_block);
+    CHECK_EQ(ph.content_type(), "text");
+    CHECK_EQ(ph.content_subtype(), "plain");
+    CHECK_EQ(hh.content_type(), "text");
+    CHECK_EQ(hh.content_subtype(), "html");
+    CHECK(split_message(plain).body.find("plain version") != std::string::npos);
+    CHECK(split_message(html).body.find("<b>styled</b>") != std::string::npos);
+}
+
+TEST_CASE("composer nests alternative inside mixed when attachments are present") {
+    const fs::path dir = fs::temp_directory_path() / "eudora_composer_tests";
+    fs::create_directories(dir);
+    const fs::path att = dir / "note.txt";
+    {
+        std::ofstream f(att, std::ios::binary);
+        f << "hi";
+    }
+    MessageComposer c;
+    c.from("", "a@b.c").to("d@e.f").subject("both")
+        .body("plain\n").html_body("<p>rich</p>\n");
+    c.attach({att, "", ""});
+    auto built = c.build();
+    CHECK(built.has_value());
+    if (!built)
+        return;
+    const HeaderSet hs = HeaderSet::parse(split_message(*built).header_block);
+    CHECK_EQ(hs.content_subtype(), "mixed");
+    // The alternative wrapper and both text subtypes appear inside.
+    CHECK(built->find("multipart/alternative") != std::string::npos);
+    CHECK(built->find("text/html") != std::string::npos);
+    CHECK(built->find("text/plain") != std::string::npos);
+    CHECK(built->find("Content-Disposition: attachment") != std::string::npos);
+}
+
 TEST_CASE("C API composer") {
     eudora_composer *c = eudora_composer_new();
     CHECK(c != nullptr);
