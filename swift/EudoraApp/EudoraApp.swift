@@ -126,6 +126,14 @@ struct EudoraApp: App {
             }
             .keyboardShortcut("k", modifiers: [.command])
             .disabled(model.selectedMessage == nil)
+            Button("Print…") {
+                if let box = model.selectedMailbox,
+                   let index = model.selectedMessage {
+                    model.printMessages(at: [index], in: box)
+                }
+            }
+            .keyboardShortcut("p", modifiers: [.command])
+            .disabled(model.selectedMessage == nil)
             Divider()
             Button("Filter Messages") {
                 if let box = model.selectedMailbox {

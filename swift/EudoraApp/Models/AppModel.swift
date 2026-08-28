@@ -7,6 +7,7 @@
 
 #if os(macOS)
 
+import AppKit
 import EudoraKit
 import Foundation
 import SwiftUI
@@ -417,6 +418,28 @@ final class AppModel: ObservableObject {
         try? src.save()
         mailboxGeneration += 1
         statusText = junk ? "Marked as junk." : "Marked as not junk."
+    }
+
+    /// Print one or more stored messages (headers + best body text).
+    func printMessages(at indices: [Int], in boxName: String) {
+        guard let mb = mailbox(named: boxName), !indices.isEmpty else { return }
+        var text = ""
+        for i in indices.sorted() {
+            guard let raw = try? mb.rawMessage(at: i),
+                  let msg = try? ParsedMessage(raw: raw) else { continue }
+            text += "From: \(msg.decodedHeader("From"))\n"
+            text += "Subject: \(msg.decodedHeader("Subject"))\n\n"
+            text += msg.bestBodyText
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+            text += "\n\n\u{000C}" // form feed between messages
+        }
+        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 540, height: 720))
+        view.string = text
+        view.font = .userFixedPitchFont(ofSize: 11)
+        let op = NSPrintOperation(view: view)
+        op.printInfo.horizontalPagination = .fit
+        op.run()
     }
 
     /// The classic Make Address Book Entry: file the sender as a nickname.

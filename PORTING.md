@@ -278,6 +278,14 @@ shipped, so `.toc` files in the wild are the mac68k layout.
   X-Eudora-Imap-Uid stamp) are implemented, but full two-way folder sync
   and the big-message/leave-on-server-days options remain POP3-only.
 
+### Deferred UI pieces
+
+- **Drag-and-drop** of messages onto sidebar mailboxes is not implemented;
+  the Transfer context menu / menu command moves messages instead.  (Per-row
+  drag off a SwiftUI `Table` is fragile enough that it was left out rather
+  than shipped without runtime verification.)  Sorting, column search,
+  multi-message selection actions, printing, and HTML rendering are all in.
+
 ### Consciously not reproduced (from the fidelity audit)
 
 These legacy behaviors were reviewed and deliberately left un-ported, with

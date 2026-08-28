@@ -311,6 +311,30 @@ extension ParsedMessage {
         }
         return decodedBody
     }
+
+    /// The first text/html part's decoded (charset-converted) source, or nil
+    /// when the message has no HTML alternative.
+    public var htmlBody: String? {
+        let all = parts
+        if let html = all.first(where: { $0.type == "text" && $0.subtype == "html" }) {
+            return html.text()
+        }
+        // A single non-multipart text/html message.
+        if all.count == 1, contentType == "text", contentSubtype == "html" {
+            return all[0].text()
+        }
+        return nil
+    }
+
+    /// True when the message's best rendering is HTML (an HTML part exists and
+    /// there is no plain-text alternative preferred by bestBodyText).
+    public var prefersHTML: Bool {
+        let all = parts
+        let hasPlain = all.contains { $0.type == "text" && $0.subtype == "plain" }
+        let hasHTML = all.contains { $0.type == "text" && $0.subtype == "html" }
+            || (contentType == "text" && contentSubtype == "html")
+        return hasHTML && !hasPlain
+    }
 }
 
 public func parseAddresses(_ headerValue: String) -> [String] {

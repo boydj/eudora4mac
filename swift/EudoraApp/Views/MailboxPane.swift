@@ -1,8 +1,11 @@
 // One mailbox: the summary table with the classic columns, over the
-// preview pane (the drawer-era split the original used).
+// preview pane (the drawer-era split the original used).  The table sorts
+// by column, filters by a search field, and its actions work across a
+// multi-message selection.
 
 #if os(macOS)
 
+import AppKit
 import EudoraKit
 import SwiftUI
 
@@ -18,11 +21,23 @@ struct MailboxPane: View {
     @Binding var selectedMessage: Int?
 
     @State private var tableSelection = Set<Int>()
+    @State private var sortOrder = [KeyPathComparator(\SummaryRow.summary.date,
+                                                      order: .reverse)]
+    @State private var searchText = ""
 
     private var rows: [SummaryRow] {
         _ = model.mailboxGeneration
         guard let mb = model.mailbox(named: mailboxName) else { return [] }
-        return mb.summaries.map { SummaryRow(id: $0.index, summary: $0) }
+        var out = mb.summaries.map { SummaryRow(id: $0.index, summary: $0) }
+        if !searchText.isEmpty {
+            let q = searchText.lowercased()
+            out = out.filter {
+                $0.summary.from.lowercased().contains(q) ||
+                $0.summary.subject.lowercased().contains(q)
+            }
+        }
+        out.sort(using: sortOrder)
+        return out
     }
 
     var body: some View {
@@ -33,10 +48,12 @@ struct MailboxPane: View {
                         messageIndex: tableSelection.first)
                 .frame(minHeight: 120)
         }
+        .searchable(text: $searchText, placement: .toolbar,
+                    prompt: "Search From and Subject")
     }
 
     private var table: some View {
-        Table(rows, selection: $tableSelection) {
+        Table(rows, selection: $tableSelection, sortOrder: $sortOrder) {
             TableColumn("•") { row in
                 Text(ClassicStyle.statusGlyph(for: row.summary.state))
                     .fontWeight(row.summary.state == .unread ? .bold : .regular)
@@ -62,24 +79,24 @@ struct MailboxPane: View {
             }
             .width(18)
 
-            TableColumn("Who") { row in
+            TableColumn("Who", value: \.summary.from) { row in
                 Text(row.summary.from)
                     .fontWeight(row.summary.state == .unread ? .semibold : .regular)
             }
             .width(min: 120, ideal: 170)
 
-            TableColumn("Date") { row in
+            TableColumn("Date", value: \.summary.date) { row in
                 Text(ClassicStyle.summaryDate(row.summary.date))
             }
             .width(min: 70, ideal: 110)
 
-            TableColumn("K") { row in
+            TableColumn("K", value: \.summary.length) { row in
                 Text(ClassicStyle.sizeK(row.summary.length))
                     .monospacedDigit()
             }
             .width(44)
 
-            TableColumn("Subject") { row in
+            TableColumn("Subject", value: \.summary.subject) { row in
                 Text(row.summary.subject)
                     .fontWeight(row.summary.state == .unread ? .semibold : .regular)
             }
@@ -95,14 +112,25 @@ struct MailboxPane: View {
             }
         }
         .onDeleteCommand {
-            if let index = tableSelection.first {
-                model.delete(messageAt: index, from: mailboxName)
-                tableSelection.removeAll()
-            }
+            deleteSelection()
         }
         .onChange(of: tableSelection) { newValue in
             selectedMessage = newValue.first
         }
+    }
+
+    // MARK: selection helpers (act across the whole multi-selection)
+
+    /// The selected TOC indices, highest first so deletes/transfers stay valid.
+    private func selectedDescending(_ selection: Set<Int>) -> [Int] {
+        selection.sorted(by: >)
+    }
+
+    private func deleteSelection() {
+        for index in selectedDescending(tableSelection) {
+            model.delete(messageAt: index, from: mailboxName)
+        }
+        tableSelection.removeAll()
     }
 
     private func openMessage(at index: Int) {
@@ -118,31 +146,37 @@ struct MailboxPane: View {
     @ViewBuilder
     private func messageContextMenu(selection: Set<Int>) -> some View {
         if let index = selection.first {
-            Button("Open") { openMessage(at: index) }
+            let multi = selection.count > 1
+            Button(multi ? "Open \(selection.count) Messages" : "Open") {
+                for i in selection { openMessage(at: i) }
+            }
             Divider()
             Button("Reply") { compose(.reply, index) }
             Button("Reply to All") { compose(.replyAll, index) }
             Button("Forward") { compose(.forward, index) }
             Button("Redirect") { compose(.redirect, index) }
             Button("Send Again") { compose(.sendAgain, index) }
+            Button("Print…") { printMessages(selection) }
             Divider()
             Menu("Status") {
-                statusButton("Unread", .unread, index)
-                statusButton("Read", .read, index)
-                statusButton("Replied", .replied, index)
-                statusButton("Forwarded", .forwarded, index)
+                statusButton("Unread", .unread, selection)
+                statusButton("Read", .read, selection)
+                statusButton("Replied", .replied, selection)
+                statusButton("Forwarded", .forwarded, selection)
             }
             Menu("Priority") {
                 ForEach(1..<6) { p in
                     Button(["Highest", "High", "Normal", "Low", "Lowest"][p - 1]) {
-                        model.setPriority(p, messageAt: index, in: mailboxName)
+                        for i in selection {
+                            model.setPriority(p, messageAt: i, in: mailboxName)
+                        }
                     }
                 }
             }
             Menu("Label") {
                 ForEach(0..<model.settings.labels.count, id: \.self) { i in
                     Button {
-                        setLabel(i, at: index)
+                        setLabel(i, across: selection)
                     } label: {
                         if let color = model.settings.labelColor(i) {
                             Label(model.settings.labelName(i),
@@ -157,22 +191,30 @@ struct MailboxPane: View {
             Menu("Transfer") {
                 ForEach(model.mailboxNames.filter { $0 != mailboxName }, id: \.self) { target in
                     Button(target) {
-                        model.transfer(messageAt: index, from: mailboxName, to: target)
+                        for i in selectedDescending(selection) {
+                            model.transfer(messageAt: i, from: mailboxName, to: target)
+                        }
+                        tableSelection.removeAll()
                     }
                 }
             }
             Divider()
             Button(mailboxName == "Junk" ? "Not Junk" : "Junk") {
-                model.markJunk(messageAt: index, from: mailboxName,
-                               junk: mailboxName != "Junk")
+                for i in selectedDescending(selection) {
+                    model.markJunk(messageAt: i, from: mailboxName,
+                                   junk: mailboxName != "Junk")
+                }
                 tableSelection.removeAll()
             }
             Button("Make Address Book Entry") {
                 model.makeAddressBookEntry(mailbox: mailboxName, index: index)
             }
             Divider()
-            Button("Delete", role: .destructive) {
-                model.delete(messageAt: index, from: mailboxName)
+            Button(multi ? "Delete \(selection.count) Messages" : "Delete",
+                   role: .destructive) {
+                for i in selectedDescending(selection) {
+                    model.delete(messageAt: i, from: mailboxName)
+                }
                 tableSelection.removeAll()
             }
         }
@@ -185,20 +227,24 @@ struct MailboxPane: View {
     }
 
     private func statusButton(_ title: String, _ state: MessageState,
-                              _ index: Int) -> some View {
+                              _ selection: Set<Int>) -> some View {
         Button(title) {
             guard let mb = model.mailbox(named: mailboxName) else { return }
-            mb.setState(state, at: index)
+            for i in selection { mb.setState(state, at: i) }
             try? mb.save()
             model.mailboxGeneration += 1
         }
     }
 
-    private func setLabel(_ label: Int, at index: Int) {
+    private func setLabel(_ label: Int, across selection: Set<Int>) {
         guard let mb = model.mailbox(named: mailboxName) else { return }
-        mb.setLabel(label, at: index)
+        for i in selection { mb.setLabel(label, at: i) }
         try? mb.save()
         model.mailboxGeneration += 1
+    }
+
+    private func printMessages(_ selection: Set<Int>) {
+        model.printMessages(at: Array(selection), in: mailboxName)
     }
 }
 

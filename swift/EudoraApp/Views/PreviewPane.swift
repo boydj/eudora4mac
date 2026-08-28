@@ -29,13 +29,18 @@ struct PreviewPane: View {
                     attachmentStrip(attachments)
                     Divider()
                 }
-                ScrollView {
-                    Text(bodyText(of: message))
-                        .font(.system(size: CGFloat(model.settings.displayFontSize))
-                            .monospaced())
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
+                if message.prefersHTML, let html = message.htmlBody {
+                    HTMLMessageView(html: html,
+                                    fontSize: CGFloat(model.settings.displayFontSize))
+                } else {
+                    ScrollView {
+                        Text(bodyText(of: message))
+                            .font(.system(size: CGFloat(model.settings.displayFontSize))
+                                .monospaced())
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                    }
                 }
             }
         } else {
