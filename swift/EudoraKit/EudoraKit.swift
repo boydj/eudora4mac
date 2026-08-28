@@ -61,6 +61,13 @@ public struct MessageSummary {
     public let spamScore: Int
     public let length: Int
     public let serialNumber: Int
+    public let flags: UInt32
+    public let opts: UInt32
+
+    /// FLAG_HAS_ATT (bit 13).
+    public var hasAttachments: Bool { flags & (1 << 13) != 0 }
+    /// Classic label color index, 0 (none) through 15 (flags bits 14-17).
+    public var labelIndex: Int { Int((flags >> 14) & 0xF) }
 }
 
 /// A classic Eudora mailbox: the mbox file plus its ".toc" sidecar.
@@ -88,7 +95,9 @@ public final class Mailbox {
             priorityDisplay: Int(s.priority_display),
             spamScore: Int(s.spam_score),
             length: Int(s.length),
-            serialNumber: Int(s.serial_num))
+            serialNumber: Int(s.serial_num),
+            flags: s.flags,
+            opts: s.opts)
     }
 
     public var summaries: [MessageSummary] {
@@ -111,6 +120,23 @@ public final class Mailbox {
         _ = eudora_mailbox_set_state(handle, Int32(index), state.rawValue)
     }
 
+    public func setLabel(_ label: Int, at index: Int) {
+        _ = eudora_mailbox_set_label(handle, Int32(index), Int32(label))
+    }
+
+    /// Appends a complete RFC 822 message (any line-end convention) with a
+    /// proper envelope and summary; returns the new index.  Call `save()`
+    /// to persist the TOC.
+    @discardableResult
+    public func append(message: String, state: MessageState? = nil) throws -> Int {
+        let idx = message.withCString { cstr in
+            eudora_mailbox_append_message(handle, cstr, strlen(cstr),
+                                          state?.rawValue ?? 0)
+        }
+        guard idx >= 0 else { throw EudoraError.fromLast() }
+        return Int(idx)
+    }
+
     @discardableResult
     public func delete(at index: Int) -> Bool {
         eudora_mailbox_delete(handle, Int32(index)) == 1
@@ -125,6 +151,38 @@ public final class Mailbox {
     public func save() throws {
         guard eudora_mailbox_save(handle) == 1 else { throw EudoraError.fromLast() }
     }
+}
+
+/// The classic 15-label palette: 1-7 are the System 7 Finder label colors
+/// the original inherited; 8-15 are Eudora's private labels (PrivColors,
+/// STR# 27900, 16-bit RGB).  Index 0 means no label.
+public enum MessageLabel {
+    public static let names: [String] = [
+        "None", "Essential", "Hot", "In Progress", "Cool", "Personal",
+        "Project 1", "Project 2",
+        "Label 8", "Label 9", "Label 10", "Label 11", "Label 12",
+        "Label 13", "Label 14", "Label 15",
+    ]
+
+    /// RGB components 0...1, indexed by label (0 = no color).
+    public static let colors: [(r: Double, g: Double, b: Double)] = [
+        (0, 0, 0),                    // 0: none
+        (1.00, 0.40, 0.00),           // 1: orange
+        (0.87, 0.13, 0.13),           // 2: red
+        (0.94, 0.35, 0.87),           // 3: pink
+        (0.40, 0.87, 0.94),           // 4: light blue
+        (0.00, 0.00, 0.87),           // 5: dark blue
+        (0.00, 0.60, 0.13),           // 6: green
+        (0.60, 0.40, 0.20),           // 7: brown
+        (1.000, 0.200, 0.200),        // 8:  65535,13107,13107
+        (1.000, 0.200, 0.800),        // 9:  65535,13107,52428
+        (0.400, 0.200, 1.000),        // 10: 26214,13107,65535
+        (0.200, 0.600, 1.000),        // 11: 13107,39321,65535
+        (0.200, 1.000, 0.800),        // 12: 13107,65535,52428
+        (0.400, 1.000, 0.200),        // 13: 26214,65535,13107
+        (1.000, 1.000, 0.400),        // 14: 65535,65535,26214
+        (0.357, 0.357, 0.200),        // 15: 23409,23409,13107
+    ]
 }
 
 // MARK: - Messages
@@ -160,6 +218,37 @@ public final class ParsedMessage {
 
 public func parseAddresses(_ headerValue: String) -> [String] {
     takeStringArray(eudora_parse_addresses(headerValue))
+}
+
+public enum BodyEncoding: Int32 {
+    case none = 0, quotedPrintable = 1, base64 = 2
+}
+
+/// Decodes a quoted-printable or base64 body part.
+public func decodeBody(_ data: String, encoding: BodyEncoding) -> String {
+    var outLen = 0
+    let decoded = data.withCString { cstr in
+        eudora_decode_body(cstr, strlen(cstr), encoding.rawValue, &outLen)
+    }
+    guard let decoded else { return data }
+    defer { eudora_string_free(decoded) }
+    return String(cString: decoded)
+}
+
+extension ParsedMessage {
+    /// 0 = plain/7bit/8bit, 1 = quoted-printable, 2 = base64, 3 = other.
+    public var transferEncoding: Int {
+        Int(eudora_message_transfer_encoding(handle))
+    }
+
+    /// The body with its Content-Transfer-Encoding undone (QP/base64).
+    public var decodedBody: String {
+        switch transferEncoding {
+        case 1: return decodeBody(body, encoding: .quotedPrintable)
+        case 2: return decodeBody(body, encoding: .base64)
+        default: return body
+        }
+    }
 }
 
 // MARK: - Address book
@@ -234,8 +323,91 @@ public enum FilterEvent: Int32 {
     case incoming = 0, outgoing = 1, manual = 2
 }
 
+public struct FilterTerm: Equatable {
+    public var header: String
+    public var verb: String // on-disk verb: "contains", "!is", "regex", ...
+    public var value: String
+
+    public init(header: String = "", verb: String = "contains", value: String = "") {
+        self.header = header
+        self.verb = verb
+        self.value = value
+    }
+
+    /// On-disk verb names in MatchEnum order, paired with the classic
+    /// editor's display names (FiltVerbPrint, STR# 28700).
+    public static let verbs: [(raw: String, display: String)] = [
+        ("contains", "contains"),
+        ("!contains", "does not contain"),
+        ("is", "is"),
+        ("!is", "is not"),
+        ("starts", "starts with"),
+        ("ends", "ends with"),
+        ("appears", "appears"),
+        ("!appears", "does not appear"),
+        ("intersects", "intersects nickname"),
+        ("disjoint", "does not intersect nickname"),
+        ("intersectsFile", "intersects address book"),
+        ("disjointFile", "does not intersect address book"),
+        ("regex", "matches regular expression"),
+        ("less", "is less than"),
+        ("greater", "is greater than"),
+    ]
+}
+
+public struct FilterRecord: Equatable {
+    public var name: String
+    public var id: Int
+    public var incoming: Bool
+    public var outgoing: Bool
+    public var manual: Bool
+    public var term1: FilterTerm
+    public var conjunction: String // "ignore", "and", "or", "unless"
+    public var term2: FilterTerm
+
+    public init(name: String = "Untitled", id: Int = 0, incoming: Bool = true,
+                outgoing: Bool = false, manual: Bool = false,
+                term1: FilterTerm = FilterTerm(), conjunction: String = "ignore",
+                term2: FilterTerm = FilterTerm()) {
+        self.name = name
+        self.id = id
+        self.incoming = incoming
+        self.outgoing = outgoing
+        self.manual = manual
+        self.term1 = term1
+        self.conjunction = conjunction
+        self.term2 = term2
+    }
+}
+
+public struct FilterActionRecord: Equatable {
+    public var keyword: String // "transfer", "junk", "stop", ...
+    public var value: String
+
+    public init(keyword: String, value: String = "") {
+        self.keyword = keyword
+        self.value = value
+    }
+
+    /// Action keywords the engine executes, with editor display names.
+    public static let keywords: [(raw: String, display: String)] = [
+        ("status", "Make Status"), ("priority", "Make Priority"),
+        ("label", "Make Label"), ("personality", "Make Personality"),
+        ("subject", "Make Subject"), ("sound", "Play Sound"),
+        ("speak", "Speak"), ("open", "Open"), ("print", "Print"),
+        ("notifyUser", "Notify User"), ("forward", "Forward To"),
+        ("redirect", "Redirect To"), ("reply", "Reply With"),
+        ("copy", "Copy To"), ("transfer", "Transfer To"),
+        ("junk", "Junk Score"), ("stop", "Skip Rest"),
+    ]
+}
+
 public final class FilterSet {
     private let handle: OpaquePointer
+
+    public init() {
+        self.handle = eudora_filters_new()
+    }
 
     public init(path: String) throws {
         guard let h = eudora_filters_load(path) else { throw EudoraError.fromLast() }
@@ -250,6 +422,105 @@ public final class FilterSet {
     deinit { eudora_filters_free(handle) }
 
     public var count: Int { Int(eudora_filters_count(handle)) }
+
+    // MARK: editing
+
+    public func record(at index: Int) -> FilterRecord? {
+        var info = eudora_filter_info()
+        guard eudora_filters_get(handle, Int32(index), &info) == 1 else { return nil }
+        func str(_ p: UnsafePointer<CChar>?) -> String {
+            p.map { String(cString: $0) } ?? ""
+        }
+        return FilterRecord(
+            name: str(info.name), id: Int(info.id),
+            incoming: info.incoming != 0, outgoing: info.outgoing != 0,
+            manual: info.manual != 0,
+            term1: FilterTerm(header: str(info.header1), verb: str(info.verb1),
+                              value: str(info.value1)),
+            conjunction: str(info.conjunction),
+            term2: FilterTerm(header: str(info.header2), verb: str(info.verb2),
+                              value: str(info.value2)))
+    }
+
+    public var records: [FilterRecord] {
+        (0..<count).compactMap { record(at: $0) }
+    }
+
+    public func update(_ record: FilterRecord, at index: Int) {
+        record.name.withCString { name in
+            record.term1.header.withCString { h1 in
+                record.term1.verb.withCString { v1 in
+                    record.term1.value.withCString { val1 in
+                        record.conjunction.withCString { conj in
+                            record.term2.header.withCString { h2 in
+                                record.term2.verb.withCString { v2 in
+                                    record.term2.value.withCString { val2 in
+                                        var info = eudora_filter_info()
+                                        info.name = name
+                                        info.incoming = record.incoming ? 1 : 0
+                                        info.outgoing = record.outgoing ? 1 : 0
+                                        info.manual = record.manual ? 1 : 0
+                                        info.header1 = h1
+                                        info.verb1 = v1
+                                        info.value1 = val1
+                                        info.conjunction = conj
+                                        info.header2 = h2
+                                        info.verb2 = v2
+                                        info.value2 = val2
+                                        _ = eudora_filters_set(handle, Int32(index), &info)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Appends a blank incoming filter; returns its index.
+    @discardableResult
+    public func add(name: String = "Untitled") -> Int {
+        Int(eudora_filters_add(handle, name))
+    }
+
+    @discardableResult
+    public func remove(at index: Int) -> Bool {
+        eudora_filters_remove(handle, Int32(index)) == 1
+    }
+
+    @discardableResult
+    public func move(from: Int, to: Int) -> Bool {
+        eudora_filters_move(handle, Int32(from), Int32(to)) == 1
+    }
+
+    public func actions(at index: Int) -> [FilterActionRecord] {
+        let n = Int(eudora_filter_action_count(handle, Int32(index)))
+        return (0..<n).compactMap { j in
+            var kw: UnsafePointer<CChar>?
+            var val: UnsafePointer<CChar>?
+            guard eudora_filter_action_get(handle, Int32(index), Int32(j), &kw, &val) == 1
+            else { return nil }
+            return FilterActionRecord(keyword: kw.map { String(cString: $0) } ?? "",
+                                      value: val.map { String(cString: $0) } ?? "")
+        }
+    }
+
+    @discardableResult
+    public func addAction(_ action: FilterActionRecord, at index: Int) -> Bool {
+        eudora_filter_action_add(handle, Int32(index), action.keyword, action.value) == 1
+    }
+
+    @discardableResult
+    public func setAction(_ action: FilterActionRecord, at index: Int, slot: Int) -> Bool {
+        eudora_filter_action_set(handle, Int32(index), Int32(slot),
+                                 action.keyword, action.value) == 1
+    }
+
+    @discardableResult
+    public func removeAction(at index: Int, slot: Int) -> Bool {
+        eudora_filter_action_remove(handle, Int32(index), Int32(slot)) == 1
+    }
 
     public func save(to path: String) throws {
         guard eudora_filters_save(handle, path) == 1 else { throw EudoraError.fromLast() }

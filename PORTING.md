@@ -29,6 +29,52 @@ ctest --test-dir build        # 6 suites, all platform-independent
 - **Linux**: the same tree builds and the full test suite runs; that is how
   the port is verified in CI-like environments.
 
+## The app — the classic UI, rebuilt
+
+`swift/EudoraApp` is a native SwiftUI recreation of the classic Eudora
+experience, running entirely on EudoraCore. On a Mac:
+
+```sh
+swift run EudoraApp          # development run
+```
+
+or open the package in Xcode and run the `EudoraApp` scheme (make an app
+target from it for a bundled release build).
+
+What it recreates, and from where:
+
+- **The mailbox window** (`MailboxPane`) — the classic summary table with
+  the Status / Priority / Attachments / Label / Who / Date / K / Subject
+  columns (ColumnHead, STR# 26100), the original status glyphs
+  (• R F Q S), priority chevrons, and the 15-label color palette
+  (System 7 labels 1-7 plus PrivColors 27900 for 8-15), over a preview
+  pane. Context menus give Status / Label / Transfer / Delete — the
+  classic Message and Transfer menus.
+- **The Mailboxes sidebar** — In / Out / Trash / Junk first with unread
+  counts, then user mailboxes; New Mailbox creation.
+- **The composition window** (`ComposeView`) — Eudora's header block
+  (From / To / Subject / Cc / Bcc / Attached) over the body, with the
+  icon bar's priority popup and the two classic verbs: **Queue** (into
+  Out as QUEUED) and **Send** (SMTP now, copy kept in Out as SENT).
+- **The Filters window** (`FiltersView`) — the two-pane editor:
+  filter list with up/down ordering, Match pane (incoming / outgoing /
+  manual, header combo, the verb menu with the classic display names,
+  conjunction, second term) and the Action pane (up to five actions),
+  reading and writing the real "Eudora Filters" file.
+- **The Address Book window** — nicknames, addresses, notes, expansion
+  preview, saved to the real "Eudora Nicknames" file.
+- **Settings** — personalities (dominant + alternates) with POP3/SMTP
+  hosts, security, credentials; the mail folder location. Stored as
+  `EudoraSettings.json` in the mail folder (move to Keychain for a
+  production build).
+- **Menus** — Message (Check Mail ⌘M, Send Queued Messages ⌘T, Filter
+  Messages ⌘J), Special (Filters…, Address Book… ⌘L, Empty Trash,
+  Compact Mailbox).
+
+Everything operates on the classic on-disk formats, so a mail folder
+migrated from a real Mac (mailboxes + `.toc` files, "Eudora Filters",
+"Eudora Nicknames") works in place.
+
 ## Attaching a SwiftUI frontend
 
 The repository root carries a **Swift package** (`Package.swift`): add this

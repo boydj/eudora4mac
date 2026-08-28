@@ -19,6 +19,7 @@ let package = Package(
     products: [
         .library(name: "EudoraKit", targets: ["EudoraKit"]),
         .library(name: "CEudoraCore", targets: ["CEudoraCore"]),
+        .executable(name: "EudoraApp", targets: ["EudoraApp"]),
     ],
     targets: [
         .target(
@@ -48,6 +49,11 @@ let package = Package(
             name: "EudoraKit",
             dependencies: ["CEudoraCore"],
             path: "swift/EudoraKit"
+        ),
+        .executableTarget(
+            name: "EudoraApp",
+            dependencies: ["EudoraKit"],
+            path: "swift/EudoraApp"
         ),
     ],
     cxxLanguageStandard: .cxx20
