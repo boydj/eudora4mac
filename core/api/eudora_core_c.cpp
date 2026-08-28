@@ -51,6 +51,24 @@ thread_local std::string g_last_error;
 
 void set_error(std::string msg) { g_last_error = std::move(msg); }
 
+// Runs fn(), turning any C++ exception into an error string plus a
+// value-initialized fallback (nullptr / 0 / false) so a bad_alloc,
+// length_error, or filesystem_error on hostile input can never cross the C
+// boundary as std::terminate.  Wraps the entry points that parse untrusted
+// data, allocate from attacker-controlled sizes, or touch the filesystem.
+template <typename Fn>
+auto guard(const char *ctx, Fn &&fn) -> decltype(fn()) {
+    using R = decltype(fn());
+    try {
+        return fn();
+    } catch (const std::exception &e) {
+        set_error(std::string(ctx) + ": " + e.what());
+    } catch (...) {
+        set_error(std::string(ctx) + ": unknown error");
+    }
+    return R();
+}
+
 // A CR or LF in a value that gets concatenated into a protocol command
 // (a From address, a login credential, an IMAP mailbox name) is a
 // command-injection vector.  Reject rather than silently strip so the
@@ -141,30 +159,34 @@ eudora_mailbox *eudora_mailbox_open(const char *mbox_path) {
         set_error("mbox_path is null");
         return nullptr;
     }
-    const std::filesystem::path box(mbox_path);
-    std::error_code ec;
-    if (!std::filesystem::exists(box, ec)) {
-        set_error("mailbox not found: " + box.string());
-        return nullptr;
-    }
-
-    auto mb = std::make_unique<eudora_mailbox>();
-    mb->toc_file = toc_path_for_mailbox(box);
-
-    // CheckTOC semantics: use the .toc when valid, else rebuild.
-    tocfmt::TocError terr = tocfmt::TocError::None;
-    if (auto toc = read_toc(mb->toc_file, box, &terr)) {
-        mb->toc = std::move(*toc);
-    } else {
-        auto built = build_toc(box);
-        if (!built) {
-            set_error("cannot scan mailbox: " + box.string());
+    // Parsing a hostile .toc / mbox can throw (bad_alloc, length_error);
+    // keep it off the C boundary.
+    return guard("open mailbox", [&]() -> eudora_mailbox * {
+        const std::filesystem::path box(mbox_path);
+        std::error_code ec;
+        if (!std::filesystem::exists(box, ec)) {
+            set_error("mailbox not found: " + box.string());
             return nullptr;
         }
-        mb->toc = std::move(*built);
-        write_toc(mb->toc, mb->toc_file);
-    }
-    return mb.release();
+
+        auto mb = std::make_unique<eudora_mailbox>();
+        mb->toc_file = toc_path_for_mailbox(box);
+
+        // CheckTOC semantics: use the .toc when valid, else rebuild.
+        tocfmt::TocError terr = tocfmt::TocError::None;
+        if (auto toc = read_toc(mb->toc_file, box, &terr)) {
+            mb->toc = std::move(*toc);
+        } else {
+            auto built = build_toc(box);
+            if (!built) {
+                set_error("cannot scan mailbox: " + box.string());
+                return nullptr;
+            }
+            mb->toc = std::move(*built);
+            write_toc(mb->toc, mb->toc_file);
+        }
+        return mb.release();
+    });
 }
 
 void eudora_mailbox_close(eudora_mailbox *mb) { delete mb; }
@@ -210,13 +232,16 @@ char *eudora_mailbox_read_message(const eudora_mailbox *mb, int32_t index) {
         set_error("message not downloaded (IMAP placeholder)");
         return nullptr;
     }
-    const std::string text =
-        read_file_range(mb->toc.mailbox_path, s.offset, s.length);
-    if (text.empty() && s.length > 0) {
-        set_error("cannot read mailbox file");
-        return nullptr;
-    }
-    return dup_string(text);
+    // A corrupt length can drive a huge allocation; guard the read.
+    return guard("read message", [&]() -> char * {
+        const std::string text =
+            read_file_range(mb->toc.mailbox_path, s.offset, s.length);
+        if (text.empty() && s.length > 0) {
+            set_error("cannot read mailbox file");
+            return nullptr;
+        }
+        return dup_string(text);
+    });
 }
 
 int eudora_mailbox_set_state(eudora_mailbox *mb, int32_t index, uint8_t state) {
@@ -455,24 +480,26 @@ char *eudora_decode_body(const char *data, size_t len, int encoding,
                          size_t *out_len) {
     if (!data || !out_len)
         return nullptr;
-    std::string out;
-    const std::string_view in(data, len);
-    bool ok = true;
-    if (encoding == 1)
-        ok = qp_decode(in, out);
-    else if (encoding == 2)
-        ok = base64_decode(in, out);
-    else
-        out.assign(in);
-    if (!ok)
-        set_error("body had decoding errors");
-    char *buf = static_cast<char *>(std::malloc(out.size() + 1));
-    if (!buf)
-        return nullptr;
-    std::memcpy(buf, out.data(), out.size());
-    buf[out.size()] = '\0';
-    *out_len = out.size();
-    return buf;
+    return guard("decode body", [&]() -> char * {
+        std::string out;
+        const std::string_view in(data, len);
+        bool ok = true;
+        if (encoding == 1)
+            ok = qp_decode(in, out);
+        else if (encoding == 2)
+            ok = base64_decode(in, out);
+        else
+            out.assign(in);
+        if (!ok)
+            set_error("body had decoding errors");
+        char *buf = static_cast<char *>(std::malloc(out.size() + 1));
+        if (!buf)
+            return nullptr;
+        std::memcpy(buf, out.data(), out.size());
+        buf[out.size()] = '\0';
+        *out_len = out.size();
+        return buf;
+    });
 }
 
 char **eudora_parse_addresses(const char *header_value) {
@@ -1493,12 +1520,14 @@ void eudora_composer_attach(eudora_composer *c, const char *path,
 char *eudora_composer_build(const eudora_composer *c) {
     if (!c)
         return nullptr;
-    auto built = comp(c)->build();
-    if (!built) {
-        set_error("cannot read attachment");
-        return nullptr;
-    }
-    return dup_string(*built);
+    return guard("build message", [&]() -> char * {
+        auto built = comp(c)->build();
+        if (!built) {
+            set_error("cannot read attachment");
+            return nullptr;
+        }
+        return dup_string(*built);
+    });
 }
 
 char *eudora_composer_sender(const eudora_composer *c) {
@@ -1522,22 +1551,26 @@ char *eudora_composer_recipients(const eudora_composer *c) {
 eudora_addressbook *eudora_addressbook_load(const char *path) {
     if (!path)
         return nullptr;
-    auto loaded = AddressBook::load(path);
-    if (!loaded) {
-        set_error("cannot read address book");
-        return nullptr;
-    }
-    auto ab = std::make_unique<eudora_addressbook>();
-    ab->book = std::move(*loaded);
-    return ab.release();
+    return guard("load address book", [&]() -> eudora_addressbook * {
+        auto loaded = AddressBook::load(path);
+        if (!loaded) {
+            set_error("cannot read address book");
+            return nullptr;
+        }
+        auto ab = std::make_unique<eudora_addressbook>();
+        ab->book = std::move(*loaded);
+        return ab.release();
+    });
 }
 
 eudora_addressbook *eudora_addressbook_parse(const char *text) {
     if (!text)
         return nullptr;
-    auto ab = std::make_unique<eudora_addressbook>();
-    ab->book = AddressBook::parse(text);
-    return ab.release();
+    return guard("parse address book", [&]() -> eudora_addressbook * {
+        auto ab = std::make_unique<eudora_addressbook>();
+        ab->book = AddressBook::parse(text);
+        return ab.release();
+    });
 }
 
 void eudora_addressbook_free(eudora_addressbook *ab) { delete ab; }
@@ -1595,22 +1628,26 @@ int32_t eudora_addressbook_import_contacts(eudora_addressbook *ab,
                                            const char *text, int overwrite) {
     if (!ab || !text)
         return 0;
-    const auto parsed = AddressBook::import_contacts(text);
-    return ab->book.merge(parsed, overwrite != 0);
+    return guard("import contacts", [&]() -> int32_t {
+        const auto parsed = AddressBook::import_contacts(text);
+        return ab->book.merge(parsed, overwrite != 0);
+    });
 }
 
 char **eudora_addressbook_expand(const eudora_addressbook *ab,
                                  const char *address_list) {
     if (!ab || !address_list)
         return nullptr;
-    const auto expanded = ab->book.expand(address_list);
-    char **arr =
-        static_cast<char **>(std::calloc(expanded.size() + 1, sizeof(char *)));
-    if (!arr)
-        return nullptr;
-    for (std::size_t i = 0; i < expanded.size(); ++i)
-        arr[i] = dup_string(expanded[i]);
-    return arr;
+    return guard("expand address list", [&]() -> char ** {
+        const auto expanded = ab->book.expand(address_list);
+        char **arr = static_cast<char **>(
+            std::calloc(expanded.size() + 1, sizeof(char *)));
+        if (!arr)
+            return nullptr;
+        for (std::size_t i = 0; i < expanded.size(); ++i)
+            arr[i] = dup_string(expanded[i]);
+        return arr;
+    });
 }
 
 int eudora_addressbook_contains(const eudora_addressbook *ab,
@@ -1625,14 +1662,16 @@ int eudora_addressbook_contains(const eudora_addressbook *ab,
 eudora_filters *eudora_filters_load(const char *path) {
     if (!path)
         return nullptr;
-    auto loaded = read_filters(path);
-    if (!loaded) {
-        set_error("cannot read filters file");
-        return nullptr;
-    }
-    auto f = std::make_unique<eudora_filters>();
-    f->filters = std::move(*loaded);
-    return f.release();
+    return guard("load filters", [&]() -> eudora_filters * {
+        auto loaded = read_filters(path);
+        if (!loaded) {
+            set_error("cannot read filters file");
+            return nullptr;
+        }
+        auto f = std::make_unique<eudora_filters>();
+        f->filters = std::move(*loaded);
+        return f.release();
+    });
 }
 
 eudora_filters *eudora_filters_parse(const char *text) {
@@ -1863,36 +1902,42 @@ eudora_fired_action *run_filters_c(const std::vector<Filter> &filters,
                                    const eudora_addressbook *book,
                                    int32_t *out_count) {
     *out_count = 0;
-    FilterEvent ev = FilterEvent::Incoming;
-    if (event == EUDORA_FILTER_OUTGOING)
-        ev = FilterEvent::Outgoing;
-    else if (event == EUDORA_FILTER_MANUAL)
-        ev = FilterEvent::Manual;
+    // Matching hostile input allocates (per-term haystacks, the fired list);
+    // keep a bad_alloc/length_error off the C boundary (no actions fire,
+    // *out_count stays 0).
+    return guard("run filters", [&]() -> eudora_fired_action * {
+        FilterEvent ev = FilterEvent::Incoming;
+        if (event == EUDORA_FILTER_OUTGOING)
+            ev = FilterEvent::Outgoing;
+        else if (event == EUDORA_FILTER_MANUAL)
+            ev = FilterEvent::Manual;
 
-    FilterContext ctx;
-    ctx.raw_message = raw;
-    ctx.summary = summary; // enables score/status/priority/date terms
-    if (book) {
-        ctx.address_in_book = [book](std::string_view addr, std::string_view) {
-            return book->book.contains_address(addr);
-        };
-    }
-    const auto fired = run_filters(filters, ev, ctx);
-    if (fired.empty())
-        return nullptr;
+        FilterContext ctx;
+        ctx.raw_message = raw;
+        ctx.summary = summary; // enables score/status/priority/date terms
+        if (book) {
+            ctx.address_in_book =
+                [book](std::string_view addr, std::string_view) {
+                    return book->book.contains_address(addr);
+                };
+        }
+        const auto fired = run_filters(filters, ev, ctx);
+        if (fired.empty())
+            return nullptr;
 
-    auto *arr = static_cast<eudora_fired_action *>(
-        std::calloc(fired.size(), sizeof(eudora_fired_action)));
-    if (!arr)
-        return nullptr;
-    for (std::size_t i = 0; i < fired.size(); ++i) {
-        arr[i].filter_name = dup_string(fired[i].filter->name);
-        arr[i].keyword =
-            dup_string(filter_keyword_string(fired[i].action.keyword));
-        arr[i].value = dup_string(fired[i].action.value);
-    }
-    *out_count = static_cast<int32_t>(fired.size());
-    return arr;
+        auto *arr = static_cast<eudora_fired_action *>(
+            std::calloc(fired.size(), sizeof(eudora_fired_action)));
+        if (!arr)
+            return nullptr;
+        for (std::size_t i = 0; i < fired.size(); ++i) {
+            arr[i].filter_name = dup_string(fired[i].filter->name);
+            arr[i].keyword =
+                dup_string(filter_keyword_string(fired[i].action.keyword));
+            arr[i].value = dup_string(fired[i].action.value);
+        }
+        *out_count = static_cast<int32_t>(fired.size());
+        return arr;
+    });
 }
 
 } // namespace
@@ -1923,12 +1968,16 @@ eudora_fired_action *eudora_filters_run_in_mailbox(
     *out_count = 0;
     // The message text AND its summary, so junk-score / status / priority /
     // date TERMS can match (FilterContext.summary), not just header/body
-    // string terms.
-    const MessageSummary &sum = mb->toc.sums[static_cast<std::size_t>(index)];
-    std::string raw;
-    if (sum.offset >= 0)
-        raw = read_file_range(mb->toc.mailbox_path, sum.offset, sum.length);
-    return run_filters_c(f->filters, event, raw, &sum, book, out_count);
+    // string terms.  run_filters_c guards the regex/allocation; guard the
+    // file read here too (a corrupt length can drive a huge allocation).
+    return guard("run filters in mailbox", [&]() -> eudora_fired_action * {
+        const MessageSummary &sum =
+            mb->toc.sums[static_cast<std::size_t>(index)];
+        std::string raw;
+        if (sum.offset >= 0)
+            raw = read_file_range(mb->toc.mailbox_path, sum.offset, sum.length);
+        return run_filters_c(f->filters, event, raw, &sum, book, out_count);
+    });
 }
 
 void eudora_fired_actions_free(eudora_fired_action *actions, int32_t count) {
