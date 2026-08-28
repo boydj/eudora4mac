@@ -81,7 +81,7 @@ struct Personality: Codable, Identifiable, Equatable {
     var leaveOnServerDays: Int = 0               // PREF_LMOS_XDAYS; 0 = forever
     var skipBigMessages: Bool = false            // PREF_NO_BIGGIES
     var bigMessageLimitK: Int = 40               // big-message limit, KB
-    var serverDeleteOnTrashEmpty: Bool = false   // PREF_SERVER_DEL (stored; not yet honored)
+    var serverDeleteOnTrashEmpty: Bool = false   // PREF_SERVER_DEL
     var useSignature: Bool = false               // PREF_SIG
     var signatureName: String = ""               // PREF_SIGFILE (file in the Signature Folder)
 

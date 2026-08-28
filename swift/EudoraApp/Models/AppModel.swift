@@ -48,6 +48,10 @@ final class AppModel: ObservableObject {
     var settingsURL: URL { mailFolder.appendingPathComponent("EudoraSettings.json") }
     var filtersURL: URL { mailFolder.appendingPathComponent("Eudora Filters") }
     var nicknamesURL: URL { mailFolder.appendingPathComponent("Eudora Nicknames") }
+    /// UIDL hashes of POP messages emptied from Trash, awaiting server delete.
+    var serverDeleteListURL: URL {
+        mailFolder.appendingPathComponent(".pop-server-delete")
+    }
     /// Signature files live in the classic "Signature Folder".
     var signatureFolderURL: URL {
         mailFolder.appendingPathComponent("Signature Folder", isDirectory: true)
@@ -212,12 +216,27 @@ final class AppModel: ObservableObject {
 
     func emptyTrash() {
         guard let trash = mailbox(named: "Trash") else { return }
+        // PREF_SERVER_DEL: if any personality deletes-from-server-on-empty,
+        // queue the UIDL hashes so the next POP check removes them upstream.
+        if settings.personalities.contains(where: { $0.serverDeleteOnTrashEmpty }) {
+            let hashes = (0..<trash.count).compactMap { trash.summary(at: $0)?.uidHash }
+                .filter { $0 != 0 }
+            if !hashes.isEmpty {
+                queueServerDelete(hashes)
+            }
+        }
         while trash.count > 0 {
             trash.delete(at: trash.count - 1)
         }
         try? trash.compact()
         refreshMailbox(named: "Trash")
         statusText = "Trash emptied."
+    }
+
+    private func queueServerDelete(_ hashes: [UInt32]) {
+        var existing = (try? String(contentsOf: serverDeleteListURL, encoding: .utf8)) ?? ""
+        for h in hashes { existing += "\(h)\n" }
+        try? existing.write(to: serverDeleteListURL, atomically: true, encoding: .utf8)
     }
 
     func compact(mailboxNamed name: String) {
@@ -442,6 +461,7 @@ final class AppModel: ObservableObject {
         isCheckingMail = true
         statusText = "Checking mail…"
         let inboxPath = mailFolder.appendingPathComponent("In").path
+        let serverDelPath = serverDeleteListURL.path
         checkMailCancel.reset()
         let cancel = checkMailCancel
         let multi = accounts.count > 1
@@ -495,8 +515,15 @@ final class AppModel: ObservableObject {
                                 ? account.bigMessageLimitK : 0,
                             leaveOnServerDays: account.leaveOnServer
                                 ? account.leaveOnServerDays : 0,
+                            serverDeleteListPath: account.serverDeleteOnTrashEmpty
+                                ? serverDelPath : nil,
                             progress: progress)
                     case .imap:
+                        // Push local read/replied changes up, then fetch new.
+                        try? imapSyncFlags(
+                            host: host, port: account.popPort, tls: tls,
+                            user: account.username, password: account.password,
+                            mailboxPath: inboxPath)
                         n = try imapFetch(
                             host: host, port: account.popPort, tls: tls,
                             user: account.username,

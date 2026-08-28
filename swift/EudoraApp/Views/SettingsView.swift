@@ -280,7 +280,7 @@ struct SettingsView: View {
         .disabled(!binding.wrappedValue.skipBigMessages)
         Toggle("Delete from server when emptied from Trash",
                isOn: binding.serverDeleteOnTrashEmpty)
-        Text("The Trash option is stored but not yet honored.")
+        Text("Mail emptied from Trash is removed from the server on the next check.")
             .font(.caption)
             .foregroundStyle(.secondary)
     }

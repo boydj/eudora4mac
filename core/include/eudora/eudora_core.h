@@ -219,6 +219,12 @@ typedef struct {
      * KB (PREF_NO_BIGGIES / big-message limit; 0 = no limit).  Skipped
      * messages are reconsidered on every later check. */
     int32_t max_message_k;
+    /* PREF_SERVER_DEL: path to a text file of decimal uid_hash values (one
+     * per line) for messages the user emptied from Trash and wants removed
+     * from the server.  On this check, any server message whose UIDL hash
+     * appears is DELE'd; the file is rewritten with the entries not yet
+     * matched.  NULL disables. */
+    const char *server_delete_list;
 } eudora_pop3_options;
 
 /* eudora_pop3_fetch_ex with the full option set; options may be NULL. */
@@ -243,6 +249,19 @@ int32_t eudora_imap_fetch_ex(const char *host, uint16_t port, int tls_mode,
                              const char *imap_mailbox,
                              const char *mbox_path, int delete_from_server,
                              eudora_progress_fn progress, void *ctx);
+
+/* List the selectable mailboxes on an IMAP server: a NULL-terminated,
+ * malloc'd array of names.  Free with eudora_addresses_free.  NULL on error. */
+char **eudora_imap_list_folders(const char *host, uint16_t port, int tls_mode,
+                                const char *user, const char *password);
+
+/* Write locally-changed message state back to the server: messages fetched
+ * from imap_mailbox (NULL="INBOX") carry an X-Eudora-Imap-Uid stamp; those
+ * now read/replied are flagged \Seen/\Answered via UID STORE.  Returns the
+ * number of messages whose flags were updated, or -1. */
+int32_t eudora_imap_sync_flags(const char *host, uint16_t port, int tls_mode,
+                               const char *user, const char *password,
+                               const char *imap_mailbox, const char *mbox_path);
 
 /* ---- SMTP -------------------------------------------------------------- */
 

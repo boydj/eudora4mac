@@ -65,6 +65,8 @@ public struct MessageSummary {
     public let serialNumber: Int
     public let flags: UInt32
     public let opts: UInt32
+    /// UIDL hash (POP) or UIDVALIDITY/UID hash (IMAP); 0 when unknown.
+    public let uidHash: UInt32
 
     /// FLAG_HAS_ATT (bit 13).
     public var hasAttachments: Bool { flags & (1 << 13) != 0 }
@@ -100,7 +102,8 @@ public final class Mailbox {
             length: Int(s.length),
             serialNumber: Int(s.serial_num),
             flags: s.flags,
-            opts: s.opts)
+            opts: s.opts,
+            uidHash: s.uid_hash)
     }
 
     public var summaries: [MessageSummary] {
@@ -744,11 +747,15 @@ public func pop3Fetch(host: String, port: UInt16, tls: TLSMode = .none,
                       user: String, password: String,
                       mailboxPath: String, deleteFromServer: Bool = false,
                       maxMessageK: Int = 0, leaveOnServerDays: Int = 0,
+                      serverDeleteListPath: String? = nil,
                       progress: FetchProgress? = nil) throws -> Int {
+    // The C string for server_delete_list must outlive the call.
+    let n = withOptionalCString(serverDeleteListPath) { sdList -> Int32 in
     var opts = eudora_pop3_options()
     opts.delete_from_server = deleteFromServer ? 1 : 0
     opts.leave_on_server_days = Int32(leaveOnServerDays)
     opts.max_message_k = Int32(maxMessageK)
+    opts.server_delete_list = sdList
 
     let n: Int32
     if let progress {
@@ -769,8 +776,16 @@ public func pop3Fetch(host: String, port: UInt16, tls: TLSMode = .none,
         n = eudora_pop3_fetch_opts(host, port, tls.rawValue, user, password,
                                    mailboxPath, &opts, nil, nil)
     }
+    return n
+    }
     guard n >= 0 else { throw EudoraError.fromLast() }
     return Int(n)
+}
+
+private func withOptionalCString<R>(_ s: String?,
+                                    _ body: (UnsafePointer<CChar>?) -> R) -> R {
+    if let s { return s.withCString { body($0) } }
+    return body(nil)
 }
 
 /// Fetches new messages from an IMAP mailbox (default INBOX) into the local
@@ -804,6 +819,28 @@ public func imapFetch(host: String, port: UInt16, tls: TLSMode = .none,
                                  imapMailbox, mailboxPath,
                                  deleteFromServer ? 1 : 0, nil, nil)
     }
+    guard n >= 0 else { throw EudoraError.fromLast() }
+    return Int(n)
+}
+
+/// The selectable mailboxes on an IMAP server.
+public func imapListFolders(host: String, port: UInt16, tls: TLSMode = .none,
+                            user: String, password: String) throws -> [String] {
+    guard let arr = eudora_imap_list_folders(host, port, tls.rawValue, user,
+                                             password)
+    else { throw EudoraError.fromLast() }
+    return takeStringArray(arr) // frees arr
+}
+
+/// Writes locally-changed read/replied state back to the IMAP server as
+/// \Seen/\Answered.  Returns the number of messages updated.
+@discardableResult
+public func imapSyncFlags(host: String, port: UInt16, tls: TLSMode = .none,
+                          user: String, password: String,
+                          imapMailbox: String = "INBOX",
+                          mailboxPath: String) throws -> Int {
+    let n = eudora_imap_sync_flags(host, port, tls.rawValue, user, password,
+                                   imapMailbox, mailboxPath)
     guard n >= 0 else { throw EudoraError.fromLast() }
     return Int(n)
 }

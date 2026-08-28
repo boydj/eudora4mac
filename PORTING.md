@@ -272,11 +272,11 @@ shipped, so `.toc` files in the wild are the mac68k layout.
   the summary) never match through `eudora_filters_run`: the C entry
   point evaluates messages without their TOC summaries.  The junk
   *action* (assigning a score) and the threshold sweep work fully.
-- The per-personality "delete from server when emptied from Trash"
-  option (PREF_SERVER_DEL) is stored but not yet honored.
 - IMAP accounts fetch INBOX into the local In mailbox (the classic
-  minimal-download flavor); folder browsing, flag write-back, and the
-  big-message/leave-on-server-days options are POP3-only for now.
+  minimal-download flavor); folder browsing (eudora_imap_list_folders) and
+  read/replied flag write-back (eudora_imap_sync_flags, via an
+  X-Eudora-Imap-Uid stamp) are implemented, but full two-way folder sync
+  and the big-message/leave-on-server-days options remain POP3-only.
 
 ### Consciously not reproduced (from the fidelity audit)
 

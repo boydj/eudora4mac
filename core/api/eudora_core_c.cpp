@@ -10,6 +10,7 @@
 #include <exception>
 #include <limits>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <utility>
@@ -693,7 +694,7 @@ int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
     // from crossing the C boundary (see the catch at the end).
     try {
     const eudora_pop3_options opts =
-        options ? *options : eudora_pop3_options{0, 0, 0};
+        options ? *options : eudora_pop3_options{0, 0, 0, nullptr};
     const int delete_from_server = opts.delete_from_server;
 
     TransportBundle bundle;
@@ -791,14 +792,35 @@ int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
     if (opts.max_message_k > 0)
         pop.list(sizes);
 
+    // PREF_SERVER_DEL: hashes of messages the user emptied from Trash and
+    // wants gone from the server.  DELE any that are still up there.
+    std::set<std::uint32_t> server_delete;
+    if (opts.server_delete_list && *opts.server_delete_list && have_uidl) {
+        std::FILE *sd = std::fopen(opts.server_delete_list, "r");
+        if (sd) {
+            char line[64];
+            while (std::fgets(line, sizeof(line), sd))
+                if (const unsigned long v = std::strtoul(line, nullptr, 10))
+                    server_delete.insert(static_cast<std::uint32_t>(v));
+            std::fclose(sd);
+        }
+    }
+    std::set<std::uint32_t> server_delete_remaining = server_delete;
+
     std::vector<std::pair<long, std::uint32_t>> wanted; // msg number, uid hash
     std::vector<std::pair<long, int>> already; // msg number, summary index
+    std::vector<long> trash_delete;            // PREF_SERVER_DEL targets
     for (long m = 1; m <= count; ++m) {
         std::uint32_t h = kNeverHashed;
         if (have_uidl) {
             const auto it = uids.find(m);
             if (it != uids.end())
                 h = kr_hash(it->second);
+        }
+        if (valid_hash(h) && server_delete.count(h)) {
+            trash_delete.push_back(m); // emptied from Trash: remove server-side
+            server_delete_remaining.erase(h);
+            continue;
         }
         int idx = -1;
         if (valid_hash(h))
@@ -842,6 +864,15 @@ int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
             break;
         }
     }
+    // PREF_SERVER_DEL: remove messages the user emptied from Trash.
+    for (const long m : trash_delete) {
+        if (!ok)
+            break;
+        if (!pop.dele(m)) {
+            set_error("DELE failed: " + pop.last_response());
+            ok = false;
+        }
+    }
 
     const long to_fetch = static_cast<long>(wanted.size());
     for (long i = 0; i < to_fetch && ok; ++i) {
@@ -881,6 +912,18 @@ int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
         // and the server's RSET-on-drop keeps DELE'd messages (they stay
         // deduped by their stored hashes).
         pop.quit();
+        // Rewrite the server-delete list with the entries not matched this
+        // session (QUIT committed the DELEs).  Entries never seen on the
+        // server stay pending; ones we DELE'd drop out.
+        if (opts.server_delete_list && *opts.server_delete_list &&
+            server_delete_remaining.size() != server_delete.size()) {
+            std::FILE *sd = std::fopen(opts.server_delete_list, "w");
+            if (sd) {
+                for (const std::uint32_t h : server_delete_remaining)
+                    std::fprintf(sd, "%u\n", h);
+                std::fclose(sd);
+            }
+        }
     }
 
     if (!write_toc(mb->toc, mb->toc_file)) {
@@ -905,7 +948,7 @@ int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
                              const char *user, const char *password,
                              const char *mbox_path, int delete_from_server,
                              eudora_progress_fn progress, void *ctx) {
-    const eudora_pop3_options opts{delete_from_server, 0, 0};
+    const eudora_pop3_options opts{delete_from_server, 0, 0, nullptr};
     return eudora_pop3_fetch_opts(host, port, tls_mode, user, password,
                                   mbox_path, &opts, progress, ctx);
 }
@@ -1066,8 +1109,13 @@ int32_t eudora_imap_fetch_ex(const char *host, uint16_t port, int tls_mode,
                 msg = &r;
         if (!msg)
             continue; // vanished between listing and fetch
+        // Stamp the server identity so flag changes can be written back
+        // later (eudora_imap_sync_flags): "<uidvalidity>.<uid>".
+        std::string stamped = "X-Eudora-Imap-Uid: " +
+                              std::to_string(info.uid_validity) + "." +
+                              std::to_string(w.uid) + "\r\n" + msg->body;
         const int32_t idx = eudora_mailbox_append_message(
-            mb.get(), msg->body.data(), msg->body.size(),
+            mb.get(), stamped.data(), stamped.size(),
             imap_flags_to_state(msg->flags));
         if (idx < 0) {
             ok = false;
@@ -1112,6 +1160,187 @@ int32_t eudora_imap_fetch_ex(const char *host, uint16_t port, int tls_mode,
         set_error("IMAP fetch failed");
         return -1;
     }
+}
+
+extern "C++" {
+namespace {
+
+// Connect, (optionally upgrade), and log in; run fn(imap); log out.
+template <class F>
+bool with_imap_session(const char *host, std::uint16_t port, int tls_mode,
+                       const char *user, const char *password, F &&fn) {
+    TransportBundle bundle;
+    Transport *transport = bundle.setup(tls_mode);
+    if (!transport)
+        return false;
+    bundle.plain.set_recv_timeout(60);
+    if (transport->connect(host, port, 45) != NetError::None) {
+        set_error("cannot connect to " + std::string(host));
+        return false;
+    }
+    if (tls_mode == EUDORA_TLS_IMMEDIATE && !bundle.start_tls(host))
+        return false;
+    ImapSession imap(*transport);
+    if (!imap.begin_connected()) {
+        set_error("no IMAP greeting");
+        return false;
+    }
+    if (tls_mode == EUDORA_TLS_STARTTLS) {
+        if (!imap.request_starttls()) {
+            set_error("server refused STARTTLS: " + imap.last_response());
+            return false;
+        }
+        if (!bundle.start_tls(host))
+            return false;
+        imap.rescan_capabilities();
+    }
+    if (!imap.login(user, password)) {
+        set_error("authentication failed: " + imap.last_response());
+        return false;
+    }
+    const bool r = fn(imap);
+    imap.logout();
+    return r;
+}
+
+bool iattr_is(std::string_view a, std::string_view b) {
+    if (a.size() != b.size())
+        return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    return true;
+}
+
+} // namespace
+} // extern "C++"
+
+char **eudora_imap_list_folders(const char *host, uint16_t port, int tls_mode,
+                                const char *user, const char *password) {
+    if (!host || !user || !password) {
+        set_error("missing argument");
+        return nullptr;
+    }
+    if (has_control_break(user) || has_control_break(password)) {
+        set_error("credentials contain a line break");
+        return nullptr;
+    }
+    std::vector<std::string> names;
+    try {
+        const bool ok = with_imap_session(
+            host, port, tls_mode, user, password, [&](ImapSession &imap) {
+                auto entries = imap.list("", "*");
+                if (!entries)
+                    return false;
+                for (const auto &e : *entries) {
+                    bool selectable = true;
+                    for (const auto &a : e.attributes)
+                        if (iattr_is(a, "\\Noselect"))
+                            selectable = false;
+                    if (selectable && !e.name.empty())
+                        names.push_back(e.name);
+                }
+                return true;
+            });
+        if (!ok)
+            return nullptr;
+    } catch (...) {
+        set_error("IMAP list failed");
+        return nullptr;
+    }
+    auto *arr = static_cast<char **>(std::calloc(names.size() + 1, sizeof(char *)));
+    if (!arr)
+        return nullptr;
+    for (std::size_t i = 0; i < names.size(); ++i)
+        arr[i] = dup_string(names[i]);
+    return arr;
+}
+
+int32_t eudora_imap_sync_flags(const char *host, uint16_t port, int tls_mode,
+                               const char *user, const char *password,
+                               const char *imap_mailbox,
+                               const char *mbox_path) {
+    if (!host || !user || !password || !mbox_path) {
+        set_error("missing argument");
+        return -1;
+    }
+    if (has_control_break(user) || has_control_break(password) ||
+        has_control_break(imap_mailbox)) {
+        set_error("credentials or mailbox name contain a line break");
+        return -1;
+    }
+    const std::string remote_box =
+        imap_mailbox && *imap_mailbox ? imap_mailbox : "INBOX";
+
+    std::unique_ptr<eudora_mailbox> mb(eudora_mailbox_open(mbox_path));
+    if (!mb)
+        return -1;
+
+    // Gather (uidvalidity, uid, seen, answered) for every stamped message.
+    struct Want {
+        std::uint32_t validity, uid;
+        bool seen, answered;
+    };
+    std::vector<Want> wants;
+    for (int i = 0; i < mb->toc.count(); ++i) {
+        const MessageSummary &s = mb->toc.sums[static_cast<std::size_t>(i)];
+        if (s.offset < 0)
+            continue;
+        const std::string raw =
+            read_file_range(mb->toc.mailbox_path, s.offset, s.length);
+        const HeaderSet hs = HeaderSet::parse(split_message(raw).header_block);
+        const auto stamp = hs.get("X-Eudora-Imap-Uid");
+        if (!stamp)
+            continue;
+        const std::string v(*stamp);
+        const auto dot = v.find('.');
+        if (dot == std::string::npos)
+            continue;
+        Want w;
+        w.validity = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+        w.uid = static_cast<std::uint32_t>(
+            std::strtoul(v.c_str() + dot + 1, nullptr, 10));
+        w.seen = s.state != MessageState::Unread;
+        w.answered = s.state == MessageState::Replied ||
+                     s.state == MessageState::Redistributed;
+        if (w.uid && (w.seen || w.answered))
+            wants.push_back(w);
+    }
+    if (wants.empty())
+        return 0;
+
+    int32_t synced = 0;
+    try {
+        const bool ok = with_imap_session(
+            host, port, tls_mode, user, password, [&](ImapSession &imap) {
+                ImapMailboxInfo info;
+                if (!imap.select(remote_box, info)) {
+                    set_error("cannot select " + remote_box);
+                    return false;
+                }
+                for (const auto &w : wants) {
+                    if (w.validity != info.uid_validity)
+                        continue; // stale mapping (mailbox reset)
+                    bool did = false;
+                    if (w.seen)
+                        did |= imap.uid_store(std::to_string(w.uid),
+                                              "+FLAGS.SILENT", "\\Seen");
+                    if (w.answered)
+                        did |= imap.uid_store(std::to_string(w.uid),
+                                              "+FLAGS.SILENT", "\\Answered");
+                    if (did)
+                        ++synced;
+                }
+                return true;
+            });
+        if (!ok)
+            return -1;
+    } catch (...) {
+        set_error("IMAP sync failed");
+        return -1;
+    }
+    return synced;
 }
 
 /* ---- SMTP -------------------------------------------------------------- */

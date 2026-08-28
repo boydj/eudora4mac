@@ -6,10 +6,12 @@
 #include <fstream>
 #include <string>
 
+#include "compat/hashes.hpp"
 #include "eudora/eudora_core.h"
 #include "test_framework.hpp"
 
 namespace fs = std::filesystem;
+using eudora::kr_hash;
 
 namespace {
 
@@ -226,6 +228,7 @@ struct MiniPop3Server {
     };
 
     std::vector<Msg> msgs;
+    std::vector<long> deleted; // message numbers DELE'd
     std::mutex mu;
     int listener = -1;
     uint16_t port = 0;
@@ -322,6 +325,7 @@ struct MiniPop3Server {
                 else
                     say("-ERR no such message\r\n");
             } else if (cmd.rfind("DELE", 0) == 0) {
+                deleted.push_back(std::strtol(cmd.c_str() + 5, nullptr, 10));
                 say("+OK\r\n");
             } else if (cmd.rfind("QUIT", 0) == 0) {
                 say("+OK bye\r\n");
@@ -436,6 +440,46 @@ TEST_CASE("C API: POP3 big-message limit skips oversized mail") {
         CHECK_EQ(std::string(sum.subject), "small");
         eudora_mailbox_close(mb);
     }
+}
+
+TEST_CASE("C API: POP3 server-delete list removes emptied-Trash mail") {
+    MiniPop3Server server;
+    server.add_message("uid-keep",
+                       "From: a@example.com\r\nSubject: keep\r\n\r\nbody a\r\n");
+    server.add_message("uid-gone",
+                       "From: b@example.com\r\nSubject: gone\r\n\r\nbody b\r\n");
+    CHECK(server.start(1));
+
+    const fs::path box = temp_dir() / "ServerDelBox";
+    const fs::path list = temp_dir() / "pending-del.txt";
+    std::error_code ec;
+    fs::remove(box, ec);
+    fs::remove(box.string() + ".toc", ec);
+
+    // The user emptied "uid-gone" from Trash: its UIDL hash is queued.
+    {
+        std::ofstream f(list, std::ios::trunc);
+        f << kr_hash("uid-gone") << "\n";
+    }
+
+    const std::string listpath = list.string();
+    eudora_pop3_options opts{};
+    opts.server_delete_list = listpath.c_str();
+    const int32_t n = eudora_pop3_fetch_opts(
+        "127.0.0.1", server.port, EUDORA_TLS_NONE, "user", "pass",
+        box.string().c_str(), &opts, nullptr, nullptr);
+    server.finish();
+
+    // Only "uid-keep" is fetched; "uid-gone" is DELE'd, not downloaded.
+    CHECK_EQ(n, 1);
+    CHECK_EQ(server.deleted.size(), static_cast<size_t>(1));
+    if (!server.deleted.empty())
+        CHECK_EQ(server.deleted[0], 2); // message 2 = uid-gone
+    // The list is rewritten empty (its one entry was consumed).
+    std::ifstream check(list);
+    std::string rest((std::istreambuf_iterator<char>(check)),
+                     std::istreambuf_iterator<char>());
+    CHECK(rest.find_first_not_of(" \r\n\t") == std::string::npos);
 }
 
 TEST_CASE("C API: POP3 UIDL dedup, progress, and cancel") {

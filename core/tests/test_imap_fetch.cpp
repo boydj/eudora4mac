@@ -41,6 +41,8 @@ struct MiniImapServer {
     unsigned long uidvalidity = 7;
     int stores = 0;
     int expunges = 0;
+    std::vector<std::string> flag_stores; // "<uid> <flags>" recorded per STORE
+    std::vector<std::string> folders = {"INBOX", "Archive", "Sent Items"};
     std::mutex mu;
     int listener = -1;
     uint16_t port = 0;
@@ -151,17 +153,24 @@ struct MiniImapServer {
                     say(r);
                 }
                 say(tag + " OK fetched\r\n");
+            } else if (cmd.rfind("LIST ", 0) == 0) {
+                for (const auto &f : folders)
+                    say("* LIST () \"/\" \"" + f + "\"\r\n");
+                say(tag + " OK listed\r\n");
             } else if (cmd.rfind("UID STORE ", 0) == 0) {
                 ++stores;
-                std::string set = cmd.substr(10);
-                set = set.substr(0, set.find(' '));
+                std::string args = cmd.substr(10);
+                std::string set = args.substr(0, args.find(' '));
+                flag_stores.push_back(set + " " + args);
+                const bool deleting = args.find("\\Deleted") != std::string::npos;
                 std::size_t pos = 0;
                 for (;;) {
                     const unsigned long uid =
                         std::strtoul(set.c_str() + pos, nullptr, 10);
-                    for (auto &m : msgs)
-                        if (m.uid == uid)
-                            m.deleted = true;
+                    if (deleting)
+                        for (auto &m : msgs)
+                            if (m.uid == uid)
+                                m.deleted = true;
                     const std::size_t comma = set.find(',', pos);
                     if (comma == std::string::npos)
                         break;
@@ -297,6 +306,66 @@ TEST_CASE("C API: IMAP delete-from-server stores \\Deleted and expunges") {
     CHECK_EQ(server.stores, 1);
     CHECK_EQ(server.expunges, 1);
     CHECK(server.msgs[0].deleted);
+}
+
+TEST_CASE("C API: IMAP folder listing skips \\Noselect") {
+    MiniImapServer server;
+    server.folders = {"INBOX", "Work", "Sent"};
+    CHECK(server.start(1));
+    char **folders = eudora_imap_list_folders("127.0.0.1", server.port,
+                                              EUDORA_TLS_NONE, "user", "pass");
+    server.finish();
+    CHECK(folders != nullptr);
+    if (folders) {
+        int count = 0;
+        for (char **p = folders; *p; ++p)
+            ++count;
+        CHECK_EQ(count, 3);
+        CHECK_EQ(std::string(folders[0]), "INBOX");
+        CHECK_EQ(std::string(folders[2]), "Sent");
+        eudora_addresses_free(folders);
+    }
+}
+
+TEST_CASE("C API: IMAP flag write-back stores \\Seen for read messages") {
+    MiniImapServer server;
+    server.uidvalidity = 42;
+    server.add_message(1001, "",
+                       "From: a@example.com\r\nSubject: one\r\n\r\nbody a\r\n");
+    server.add_message(1002, "",
+                       "From: b@example.com\r\nSubject: two\r\n\r\nbody b\r\n");
+    CHECK(server.start(2)); // fetch session + sync session
+
+    const fs::path box = temp_dir() / "ImapSyncBox";
+    std::error_code ec;
+    fs::remove(box, ec);
+    fs::remove(box.string() + ".toc", ec);
+
+    int32_t n = fetch(server, box);
+    CHECK_EQ(n, 2);
+
+    // Mark the first message read locally, then sync.
+    {
+        eudora_mailbox *mb = eudora_mailbox_open(box.string().c_str());
+        CHECK(mb != nullptr);
+        if (mb) {
+            eudora_mailbox_set_state(mb, 0, EUDORA_STATE_READ);
+            eudora_mailbox_save(mb);
+            eudora_mailbox_close(mb);
+        }
+    }
+    const int32_t synced = eudora_imap_sync_flags(
+        "127.0.0.1", server.port, EUDORA_TLS_NONE, "user", "pass", nullptr,
+        box.string().c_str());
+    server.finish();
+
+    CHECK_EQ(synced, 1);
+    bool saw_seen = false;
+    for (const auto &s : server.flag_stores)
+        if (s.find("1001") != std::string::npos &&
+            s.find("\\Seen") != std::string::npos)
+            saw_seen = true;
+    CHECK(saw_seen);
 }
 
 #endif // !_WIN32
