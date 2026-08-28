@@ -34,8 +34,10 @@ TEST_CASE("charset: single-byte tables convert to UTF-8") {
     // utf-16be with a BOM
     CHECK(charset_to_utf8("utf-16", std::string("\xFE\xFF\x00\x41", 4), out));
     CHECK_EQ(out, "A");
-    // an unknown charset is rejected (caller keeps the bytes)
-    CHECK(!charset_to_utf8("iso-2022-jp", "whatever", out));
+    // A charset no table and no platform converter knows is rejected so the
+    // caller keeps the bytes.  (iso-2022-jp etc. resolve on macOS through
+    // the CoreFoundation fallback, so use a name nothing recognizes.)
+    CHECK(!charset_to_utf8("x-not-a-real-charset-zzz", "whatever", out));
 }
 
 TEST_CASE("attachments: uuencode round-trips") {
