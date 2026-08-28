@@ -1,0 +1,95 @@
+# Build the app on a macOS runner, launch it against a seeded demo mail
+# folder, and screenshot it for the README.
+#
+# - workflow_dispatch: capture, then (by default) open a PR that commits the
+#   screenshots under docs/screenshots/ and refreshes the README block.
+# - push to a claude/** branch: capture and upload the images as an artifact
+#   only (for iterating on the workflow without opening PRs).
+
+name: Screenshots
+
+on:
+  workflow_dispatch:
+    inputs:
+      open_pr:
+        description: "Open a PR committing the screenshots + README update"
+        type: boolean
+        default: true
+  push:
+    branches:
+      - "claude/**"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  capture:
+    name: Capture app screenshots (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Package Eudora.app
+        run: bash packaging/make_app_bundle.sh .build/release dist 0.0.0-dev
+
+      - name: Seed a demo mail folder
+        run: |
+          DEMO="$RUNNER_TEMP/EudoraDemo/Eudora Folder"
+          bash packaging/screenshots/seed_demo_folder.sh "$DEMO"
+          echo "DEMO_FOLDER=$DEMO" >> "$GITHUB_ENV"
+
+      - name: Point the app at the demo folder
+        run: |
+          # @AppStorage("mailFolderPath") persists under the app's bundle id.
+          defaults write net.jbip.eudora mailFolderPath "$DEMO_FOLDER"
+          defaults write net.jbip.eudora NSQuitAlwaysKeepsWindows -bool false
+
+      - name: Launch and screenshot the main window
+        run: |
+          set -x
+          mkdir -p docs/screenshots
+          open dist/Eudora.app
+          # Give the app time to open its window and build the demo TOCs.
+          sleep 15
+          osascript -e 'tell application "Eudora" to activate' || true
+          sleep 3
+          screencapture -x docs/screenshots/main.png
+          killall EudoraApp || true
+          echo "--- captured image ---"
+          ls -l docs/screenshots
+          sips -g pixelWidth -g pixelHeight docs/screenshots/main.png || true
+          # Fail early if nothing was captured.
+          test -s docs/screenshots/main.png
+
+      - name: Upload screenshots artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eudora-screenshots
+          path: docs/screenshots/*.png
+          if-no-files-found: error
+
+      - name: Embed screenshots in the README
+        if: github.event_name == 'workflow_dispatch' && inputs.open_pr
+        run: bash packaging/screenshots/embed_in_readme.sh README.md
+
+      - name: Open a PR with the screenshots
+        if: github.event_name == 'workflow_dispatch' && inputs.open_pr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/screenshots
+          base: main
+          add-paths: |
+            docs/screenshots/*.png
+            README.md
+          commit-message: "Add app screenshots to the README"
+          title: "Add app screenshots to the README"
+          body: |
+            Screenshots captured by the **Screenshots** workflow on a macOS
+            runner, against a seeded demo mail folder, and embedded into the
+            README's screenshots block.
+
+            🤖 Generated with [Claude Code](https://claude.com/claude-code)
