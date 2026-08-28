@@ -11,6 +11,16 @@ import EudoraKit
 import Foundation
 import SwiftUI
 
+/// Thread-safe cancellation flag shared between the UI (Stop button) and the
+/// background fetch, which polls it from its progress callback.
+final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func cancel() { lock.lock(); value = true; lock.unlock() }
+    func reset() { lock.lock(); value = false; lock.unlock() }
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return value }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     // MARK: mail folder
@@ -168,6 +178,8 @@ final class AppModel: ObservableObject {
 
     // MARK: network operations
 
+    private let checkMailCancel = CancelFlag()
+
     func checkMail() {
         guard !isCheckingMail else { return }
         let account = settings.dominant
@@ -178,6 +190,9 @@ final class AppModel: ObservableObject {
         isCheckingMail = true
         statusText = "Checking mail at \(account.popHost)…"
         let inboxPath = mailFolder.appendingPathComponent("In").path
+        let host = account.popHost
+        checkMailCancel.reset()
+        let cancel = checkMailCancel
 
         Task.detached {
             let result: Result<Int, Error>
@@ -193,24 +208,59 @@ final class AppModel: ObservableObject {
                                       tls: tls, user: account.username,
                                       password: account.password,
                                       mailboxPath: inboxPath,
-                                      deleteFromServer: !account.leaveOnServer)
+                                      deleteFromServer: !account.leaveOnServer,
+                                      progress: { stage, done, total in
+                    let text: String
+                    switch stage {
+                    case "connect": text = "Connecting to \(host)…"
+                    case "auth": text = "Logging in…"
+                    case "list": text = "Looking for new mail…"
+                    case "retr":
+                        if total == 0 {
+                            text = "No new mail on the server."
+                        } else if done >= total {
+                            text = "Retrieved \(total) message\(total == 1 ? "" : "s")."
+                        } else {
+                            text = "Retrieving message \(done + 1) of \(total)…"
+                        }
+                    default: text = "Checking mail at \(host)…"
+                    }
+                    Task { @MainActor [weak self] in
+                        self?.statusText = text
+                    }
+                    return !cancel.isCancelled
+                })
                 result = .success(n)
             } catch {
                 result = .failure(error)
             }
+            let wasStopped = cancel.isCancelled
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isCheckingMail = false
                 self.refreshMailbox(named: "In")
                 switch result {
                 case .success(let n):
-                    self.statusText = n == 0 ? "You have no new mail."
-                        : "You have \(n) new message\(n == 1 ? "" : "s")."
+                    if wasStopped {
+                        self.statusText = n == 0 ? "Mail check stopped."
+                            : "Mail check stopped after \(n) message\(n == 1 ? "" : "s")."
+                    } else {
+                        self.statusText = n == 0 ? "You have no new mail."
+                            : "You have \(n) new message\(n == 1 ? "" : "s")."
+                    }
                 case .failure(let error):
                     self.statusText = "Check failed: \(error)"
                 }
             }
         }
+    }
+
+    /// The Stop button next to the status spinner.  The fetch notices at its
+    /// next progress step; anything already downloaded stays in the mailbox.
+    func stopCheckingMail() {
+        guard isCheckingMail else { return }
+        checkMailCancel.cancel()
+        statusText = "Stopping…"
     }
 
     /// Send every QUEUED message in Out (the classic Send Queued Messages).

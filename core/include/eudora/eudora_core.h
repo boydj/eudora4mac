@@ -133,12 +133,33 @@ enum {
     EUDORA_TLS_IMMEDIATE = 2 /* TLS from connect (POP3S/SMTPS ports) */
 };
 
-/* Fetch all messages into the mailbox at mbox_path (appending, updating the
- * TOC, exactly as the POP engine appended to In).  delete_from_server: DELE
- * after retrieval.  Returns the number of messages fetched, or -1. */
+/* Fetch new messages into the mailbox at mbox_path (appending, updating the
+ * TOC, exactly as the POP engine appended to In).  Messages already fetched
+ * on an earlier check are recognized by their UIDL hash (the legacy
+ * leave-mail-on-server bookkeeping) and skipped; servers without UIDL fall
+ * back to fetching everything.  delete_from_server: DELE after retrieval
+ * (and for already-fetched messages, without re-downloading them).
+ * Returns the number of messages fetched, or -1. */
 int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
                           const char *user, const char *password,
                           const char *mbox_path, int delete_from_server);
+
+/* Progress/cancel callback for eudora_pop3_fetch_ex.  stage is one of
+ * "connect", "auth", "list", "retr"; for "retr", done is the number of
+ * messages stored so far and total the number that will be fetched (both 0
+ * for the other stages).  Return nonzero to cancel: messages already stored
+ * are kept and the TOC is still written. */
+typedef int (*eudora_progress_fn)(void *ctx, const char *stage,
+                                  int32_t done, int32_t total);
+
+/* eudora_pop3_fetch with progress reporting and cancellation.  progress may
+ * be NULL; ctx is passed through to it.  A cancelled fetch returns the
+ * number of messages stored before the cancel (never -1 for the cancel
+ * itself). */
+int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
+                             const char *user, const char *password,
+                             const char *mbox_path, int delete_from_server,
+                             eudora_progress_fn progress, void *ctx);
 
 /* ---- SMTP -------------------------------------------------------------- */
 

@@ -111,6 +111,11 @@ struct MainWindow: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+            if model.isCheckingMail {
+                Button("Stop") { model.stopCheckingMail() }
+                    .controlSize(.small)
+                    .help("Stop checking mail; messages already retrieved are kept.")
+            }
             Spacer()
         }
         .padding(.horizontal, 10)

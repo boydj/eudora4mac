@@ -164,33 +164,78 @@ TEST_CASE("C API: filters") {
 }
 
 #if !defined(_WIN32)
+#include <algorithm>
+#include <mutex>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
-TEST_CASE("C API: POP3 fetch against a live localhost server") {
-    // A miniature POP3 server on a loopback socket, driving the real
-    // PosixTransport end to end.
-    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(listener >= 0);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-    CHECK(::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
-    CHECK(::listen(listener, 1) == 0);
-    socklen_t alen = sizeof(addr);
-    CHECK(::getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &alen) == 0);
-    const uint16_t port = ntohs(addr.sin_port);
+namespace {
 
-    std::thread server([listener] {
-        const int c = ::accept(listener, nullptr, nullptr);
-        if (c < 0)
-            return;
-        const auto say = [c](const char *s) { (void)!::write(c, s, strlen(s)); };
-        char buf[512];
-        const auto readline = [&]() -> std::string {
+// A miniature POP3 server on a loopback socket, driving the real
+// PosixTransport end to end.  Serves a fixed number of sequential sessions;
+// the message list may change between sessions (it is mutex-guarded).
+struct MiniPop3Server {
+    struct Msg {
+        std::string uid;
+        std::string text; // CRLF-terminated lines
+    };
+
+    std::vector<Msg> msgs;
+    std::mutex mu;
+    int listener = -1;
+    uint16_t port = 0;
+    std::thread thread;
+
+    void add_message(std::string uid, std::string text) {
+        std::lock_guard<std::mutex> lock(mu);
+        msgs.push_back({std::move(uid), std::move(text)});
+    }
+
+    bool start(int connections) {
+        listener = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listener < 0)
+            return false;
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (::bind(listener, reinterpret_cast<sockaddr *>(&addr),
+                   sizeof(addr)) != 0 ||
+            ::listen(listener, 1) != 0)
+            return false;
+        socklen_t alen = sizeof(addr);
+        if (::getsockname(listener, reinterpret_cast<sockaddr *>(&addr),
+                          &alen) != 0)
+            return false;
+        port = ntohs(addr.sin_port);
+        thread = std::thread([this, connections] {
+            for (int i = 0; i < connections; ++i) {
+                const int c = ::accept(listener, nullptr, nullptr);
+                if (c < 0)
+                    return;
+                serve(c);
+            }
+        });
+        return true;
+    }
+
+    void finish() {
+        if (thread.joinable())
+            thread.join();
+        if (listener >= 0) {
+            ::close(listener);
+            listener = -1;
+        }
+    }
+
+    void serve(int c) {
+        const auto say = [c](const std::string &s) {
+            (void)!::write(c, s.data(), s.size());
+        };
+        const auto readline = [c]() -> std::string {
             std::string line;
             char ch;
             while (::read(c, &ch, 1) == 1) {
@@ -205,40 +250,70 @@ TEST_CASE("C API: POP3 fetch against a live localhost server") {
             const std::string cmd = readline();
             if (cmd.empty())
                 break;
-            if (cmd.rfind("CAPA", 0) == 0)
+            std::lock_guard<std::mutex> lock(mu);
+            if (cmd.rfind("CAPA", 0) == 0) {
                 say("+OK\r\nUIDL\r\nTOP\r\n.\r\n");
-            else if (cmd.rfind("USER", 0) == 0 || cmd.rfind("PASS", 0) == 0)
+            } else if (cmd.rfind("USER", 0) == 0 || cmd.rfind("PASS", 0) == 0) {
                 say("+OK\r\n");
-            else if (cmd.rfind("STAT", 0) == 0)
-                say("+OK 1 90\r\n");
-            else if (cmd.rfind("RETR", 0) == 0)
-                say("+OK\r\n"
-                    "From: remote@server.example\r\n"
-                    "Subject: fetched\r\n"
-                    "\r\n"
-                    ".dotted first line\r\n"
-                    "plain body\r\n"
-                    ".\r\n");
-            else if (cmd.rfind("QUIT", 0) == 0) {
+            } else if (cmd.rfind("STAT", 0) == 0) {
+                std::size_t total = 0;
+                for (const auto &m : msgs)
+                    total += m.text.size();
+                say("+OK " + std::to_string(msgs.size()) + " " +
+                    std::to_string(total) + "\r\n");
+            } else if (cmd.rfind("UIDL", 0) == 0) {
+                std::string reply = "+OK\r\n";
+                for (std::size_t i = 0; i < msgs.size(); ++i)
+                    reply += std::to_string(i + 1) + " " + msgs[i].uid + "\r\n";
+                say(reply + ".\r\n");
+            } else if (cmd.rfind("LIST", 0) == 0) {
+                std::string reply = "+OK\r\n";
+                for (std::size_t i = 0; i < msgs.size(); ++i)
+                    reply += std::to_string(i + 1) + " " +
+                             std::to_string(msgs[i].text.size()) + "\r\n";
+                say(reply + ".\r\n");
+            } else if (cmd.rfind("RETR", 0) == 0) {
+                const long n = std::strtol(cmd.c_str() + 5, nullptr, 10);
+                if (n >= 1 && n <= static_cast<long>(msgs.size()))
+                    say("+OK\r\n" + msgs[static_cast<std::size_t>(n) - 1].text +
+                        ".\r\n");
+                else
+                    say("-ERR no such message\r\n");
+            } else if (cmd.rfind("DELE", 0) == 0) {
+                say("+OK\r\n");
+            } else if (cmd.rfind("QUIT", 0) == 0) {
                 say("+OK bye\r\n");
                 break;
-            } else
+            } else {
                 say("+OK\r\n");
+            }
         }
         ::close(c);
-        (void)buf;
-    });
+    }
+};
+
+} // namespace
+
+TEST_CASE("C API: POP3 fetch against a live localhost server") {
+    MiniPop3Server server;
+    server.add_message("uid-0001",
+                       "From: remote@server.example\r\n"
+                       "Subject: fetched\r\n"
+                       "\r\n"
+                       ".dotted first line\r\n"
+                       "plain body\r\n");
+    CHECK(server.start(1));
 
     const fs::path box = temp_dir() / "FetchedBox";
     std::error_code ec;
     fs::remove(box, ec);
     fs::remove(box.string() + ".toc", ec);
 
-    const int32_t n = eudora_pop3_fetch("127.0.0.1", port, EUDORA_TLS_NONE,
-                                        "user", "pass", box.string().c_str(),
+    const int32_t n = eudora_pop3_fetch("127.0.0.1", server.port,
+                                        EUDORA_TLS_NONE, "user", "pass",
+                                        box.string().c_str(),
                                         /*delete_from_server=*/0);
-    server.join();
-    ::close(listener);
+    server.finish();
 
     CHECK_EQ(n, 1);
     eudora_mailbox *mb = eudora_mailbox_open(box.string().c_str());
@@ -259,6 +334,101 @@ TEST_CASE("C API: POP3 fetch against a live localhost server") {
         }
         eudora_mailbox_close(mb);
     }
+}
+
+namespace {
+
+// Progress recorder for eudora_pop3_fetch_ex (must have C linkage-compatible
+// shape: a capture-less callback plus a context struct).
+struct FetchProgress {
+    std::vector<std::string> stages;
+    int32_t last_done = -1;
+    int32_t last_total = -1;
+    int cancel_at = -1; // cancel when a "retr" callback reports done >= this
+};
+
+int fetch_progress_cb(void *ctx, const char *stage, int32_t done,
+                      int32_t total) {
+    auto *p = static_cast<FetchProgress *>(ctx);
+    p->stages.push_back(stage);
+    if (std::string(stage) == "retr") {
+        p->last_done = done;
+        p->last_total = total;
+        if (p->cancel_at >= 0 && done >= p->cancel_at)
+            return 1;
+    }
+    return 0;
+}
+
+} // namespace
+
+TEST_CASE("C API: POP3 UIDL dedup, progress, and cancel") {
+    MiniPop3Server server;
+    server.add_message("uid-alpha",
+                       "From: a@example.com\r\nSubject: alpha\r\n\r\nbody a\r\n");
+    server.add_message("uid-beta",
+                       "From: b@example.com\r\nSubject: beta\r\n\r\nbody b\r\n");
+    CHECK(server.start(4));
+
+    const fs::path box = temp_dir() / "DedupBox";
+    std::error_code ec;
+    fs::remove(box, ec);
+    fs::remove(box.string() + ".toc", ec);
+
+    // First fetch: both messages arrive, with progress through every stage.
+    FetchProgress prog;
+    int32_t n = eudora_pop3_fetch_ex("127.0.0.1", server.port, EUDORA_TLS_NONE,
+                                     "user", "pass", box.string().c_str(), 0,
+                                     fetch_progress_cb, &prog);
+    CHECK_EQ(n, 2);
+    for (const char *stage : {"connect", "auth", "list", "retr"})
+        CHECK(std::find(prog.stages.begin(), prog.stages.end(), stage) !=
+              prog.stages.end());
+    CHECK_EQ(prog.last_done, 2);
+    CHECK_EQ(prog.last_total, 2);
+
+    // Second fetch (via the plain entry point): the UIDL hashes recorded in
+    // the TOC dedup both messages — nothing is re-downloaded.
+    n = eudora_pop3_fetch("127.0.0.1", server.port, EUDORA_TLS_NONE, "user",
+                          "pass", box.string().c_str(), 0);
+    CHECK_EQ(n, 0);
+    {
+        eudora_mailbox *mb = eudora_mailbox_open(box.string().c_str());
+        CHECK(mb != nullptr);
+        if (mb) {
+            CHECK_EQ(eudora_mailbox_count(mb), 2);
+            eudora_mailbox_close(mb);
+        }
+    }
+
+    // A message added on the server side: only the new one is fetched.
+    server.add_message("uid-gamma",
+                       "From: c@example.com\r\nSubject: gamma\r\n\r\nbody c\r\n");
+    n = eudora_pop3_fetch("127.0.0.1", server.port, EUDORA_TLS_NONE, "user",
+                          "pass", box.string().c_str(), 0);
+    CHECK_EQ(n, 1);
+
+    // Cancel from the callback before the first RETR: the new fourth message
+    // stays on the server and the mailbox is untouched.
+    server.add_message("uid-delta",
+                       "From: d@example.com\r\nSubject: delta\r\n\r\nbody d\r\n");
+    FetchProgress cancelProg;
+    cancelProg.cancel_at = 0;
+    n = eudora_pop3_fetch_ex("127.0.0.1", server.port, EUDORA_TLS_NONE, "user",
+                             "pass", box.string().c_str(), 0,
+                             fetch_progress_cb, &cancelProg);
+    CHECK_EQ(n, 0);
+
+    eudora_mailbox *mb = eudora_mailbox_open(box.string().c_str());
+    CHECK(mb != nullptr);
+    if (mb) {
+        CHECK_EQ(eudora_mailbox_count(mb), 3);
+        eudora_summary sum{};
+        CHECK(eudora_mailbox_summary(mb, 2, &sum));
+        CHECK_EQ(std::string(sum.subject), "gamma");
+        eudora_mailbox_close(mb);
+    }
+    server.finish();
 }
 #endif // !_WIN32
 

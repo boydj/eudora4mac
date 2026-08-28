@@ -606,14 +606,47 @@ public enum TLSMode: Int32 {
     case immediate = 2   // TLS from connect (995/993/465)
 }
 
-/// Fetches all messages from a POP3 server into the mailbox at `mailboxPath`
-/// (creating it if needed) and updates its ".toc".  Returns the number of
-/// messages fetched.
+/// Progress reported during `pop3Fetch`: the stage ("connect", "auth",
+/// "list", or "retr"), the number of messages stored so far, and the total
+/// that will be fetched (both counts are 0 outside the "retr" stage).
+/// Return `false` to stop the fetch: messages already stored are kept and
+/// the mailbox's table of contents is still written.
+public typealias FetchProgress = (_ stage: String, _ done: Int, _ total: Int) -> Bool
+
+private final class FetchProgressBox {
+    let callback: FetchProgress
+    init(_ callback: @escaping FetchProgress) { self.callback = callback }
+}
+
+/// Fetches new messages from a POP3 server into the mailbox at `mailboxPath`
+/// (creating it if needed) and updates its ".toc".  Messages fetched on an
+/// earlier check are recognized by their UIDL and skipped.  Returns the
+/// number of messages fetched (a stopped fetch returns the count stored
+/// before the stop, without throwing).
 public func pop3Fetch(host: String, port: UInt16, tls: TLSMode = .none,
                       user: String, password: String,
-                      mailboxPath: String, deleteFromServer: Bool = false) throws -> Int {
-    let n = eudora_pop3_fetch(host, port, tls.rawValue, user, password,
+                      mailboxPath: String, deleteFromServer: Bool = false,
+                      progress: FetchProgress? = nil) throws -> Int {
+    let n: Int32
+    if let progress {
+        let box = FetchProgressBox(progress)
+        n = withExtendedLifetime(box) {
+            eudora_pop3_fetch_ex(
+                host, port, tls.rawValue, user, password,
+                mailboxPath, deleteFromServer ? 1 : 0,
+                { ctx, stage, done, total in
+                    guard let ctx, let stage else { return 0 }
+                    let box = Unmanaged<FetchProgressBox>.fromOpaque(ctx)
+                        .takeUnretainedValue()
+                    return box.callback(String(cString: stage),
+                                        Int(done), Int(total)) ? 0 : 1
+                },
+                Unmanaged.passUnretained(box).toOpaque())
+        }
+    } else {
+        n = eudora_pop3_fetch(host, port, tls.rawValue, user, password,
                               mailboxPath, deleteFromServer ? 1 : 0)
+    }
     guard n >= 0 else { throw EudoraError.fromLast() }
     return Int(n)
 }

@@ -2,13 +2,18 @@
 
 #include "eudora/eudora_core.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "addressbook/nicknames.hpp"
+#include "compat/hashes.hpp"
 #include "compat/macdate.hpp"
 #include "filters/filter_file.hpp"
 #include "filters/match_engine.hpp"
@@ -486,9 +491,10 @@ int32_t eudora_mailbox_append_message(eudora_mailbox *mb, const char *raw,
     return mb->toc.count() - 1;
 }
 
-int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
-                          const char *user, const char *password,
-                          const char *mbox_path, int delete_from_server) {
+int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
+                             const char *user, const char *password,
+                             const char *mbox_path, int delete_from_server,
+                             eudora_progress_fn progress, void *ctx) {
     if (!host || !user || !password || !mbox_path) {
         set_error("missing argument");
         return -1;
@@ -498,9 +504,32 @@ int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
     Transport *transport = bundle.setup(tls_mode);
     if (!transport)
         return -1;
+    // A silent server must not hang Check Mail forever: the legacy engine
+    // bounded every read with the TIMEOUT setting; 60s matches its default
+    // ceiling.
+    bundle.plain.set_recv_timeout(60);
+
+    // Cancellation: a nonzero return from the callback trips the transport's
+    // cancel token, so an in-flight blocking read also bails out.
+    std::atomic<bool> cancel_flag{false};
+    bundle.plain.set_cancel_flag(&cancel_flag);
+    if (bundle.active && bundle.active != &bundle.plain)
+        bundle.active->set_cancel_flag(&cancel_flag);
+    const auto report = [&](const char *stage, long done, long total) {
+        if (cancel_flag.load(std::memory_order_relaxed))
+            return false;
+        if (progress && progress(ctx, stage, static_cast<int32_t>(done),
+                                 static_cast<int32_t>(total)) != 0) {
+            cancel_flag.store(true, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    };
 
     Pop3Session pop(*transport);
 
+    if (!report("connect", 0, 0))
+        return 0;
     if (transport->connect(host, port, 45) != NetError::None) {
         set_error("cannot connect to " + std::string(host));
         return -1;
@@ -521,11 +550,15 @@ int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
             return -1;
         pop.rescan_capabilities();
     }
+    if (!report("auth", 0, 0))
+        return 0;
     if (!pop.login(user, password)) {
         set_error("authentication failed: " + pop.last_response());
         return -1;
     }
 
+    if (!report("list", 0, 0))
+        return 0;
     long count = 0, total = 0;
     if (!pop.stat(count, total)) {
         set_error("STAT failed: " + pop.last_response());
@@ -546,9 +579,49 @@ int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
     if (!mb)
         return -1;
 
+    // UIDL dedup (FillWithUidl + MSumType.uidHash): a message whose unique-id
+    // hash already appears in a summary was fetched on an earlier check and
+    // left on the server — skip it.  Servers without UIDL fall back to
+    // fetching everything.
+    std::map<long, std::string> uids;
+    const bool have_uidl = count > 0 && pop.uidl(uids);
+
+    std::vector<std::pair<long, std::uint32_t>> wanted; // msg number, uid hash
+    std::vector<long> already;                          // fetched previously
+    for (long m = 1; m <= count; ++m) {
+        std::uint32_t h = kNeverHashed;
+        if (have_uidl) {
+            const auto it = uids.find(m);
+            if (it != uids.end())
+                h = kr_hash(it->second);
+        }
+        if (valid_hash(h) && mb->toc.find_by_hash(h) >= 0)
+            already.push_back(m);
+        else
+            wanted.emplace_back(m, h);
+    }
+
     int32_t fetched = 0;
     bool ok = true;
-    for (long m = 1; m <= count && ok; ++m) {
+
+    // With "delete from server" on, messages stored on an earlier check are
+    // deleted without downloading them again.
+    if (delete_from_server) {
+        for (const long m : already) {
+            if (!pop.dele(m)) {
+                set_error("DELE failed: " + pop.last_response());
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    const long to_fetch = static_cast<long>(wanted.size());
+    for (long i = 0; i < to_fetch && ok; ++i) {
+        if (!report("retr", i, to_fetch))
+            break;
+        const long m = wanted[static_cast<std::size_t>(i)].first;
+        const std::uint32_t h = wanted[static_cast<std::size_t>(i)].second;
         std::string message;
         ok = pop.retrieve(m, [&](std::string_view line) {
             message.append(line.data(), line.size());
@@ -557,11 +630,15 @@ int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
             set_error("RETR failed: " + pop.last_response());
             break;
         }
-        if (eudora_mailbox_append_message(mb.get(), message.data(),
-                                          message.size(), 0) < 0) {
+        const int32_t idx = eudora_mailbox_append_message(
+            mb.get(), message.data(), message.size(), 0);
+        if (idx < 0) {
             ok = false;
             break;
         }
+        // Stamp the UIDL hash so the next check skips this message.
+        if (valid_hash(h))
+            mb->toc.sums[static_cast<std::size_t>(idx)].uid_hash = h;
         ++fetched;
 
         if (delete_from_server && !pop.dele(m)) {
@@ -569,13 +646,33 @@ int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
             ok = false;
         }
     }
-    pop.quit();
+
+    const bool cancelled = cancel_flag.load(std::memory_order_relaxed);
+    if (!cancelled) {
+        report("retr", fetched, to_fetch);
+        // On cancel, skip QUIT: the token makes it fail immediately anyway,
+        // and the server's RSET-on-drop keeps DELE'd messages (they stay
+        // deduped by their stored hashes).
+        pop.quit();
+    }
 
     if (!write_toc(mb->toc, mb->toc_file)) {
         set_error("cannot write TOC");
         return -1;
     }
+    if (cancelled) {
+        set_error("cancelled");
+        return fetched;
+    }
     return ok ? fetched : -1;
+}
+
+int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
+                          const char *user, const char *password,
+                          const char *mbox_path, int delete_from_server) {
+    return eudora_pop3_fetch_ex(host, port, tls_mode, user, password,
+                                mbox_path, delete_from_server, nullptr,
+                                nullptr);
 }
 
 /* ---- SMTP -------------------------------------------------------------- */
@@ -593,6 +690,8 @@ int eudora_smtp_send(const char *host, uint16_t port, int tls_mode,
     Transport *transport = bundle.setup(tls_mode);
     if (!transport)
         return 601;
+    // Same watchdog as the POP engine: never block forever on a dead server.
+    bundle.plain.set_recv_timeout(60);
 
     SmtpSession smtp(*transport);
 
