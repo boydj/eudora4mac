@@ -13,15 +13,27 @@ struct ComposeView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
 
-    @State private var to = ""
-    @State private var cc = ""
-    @State private var bcc = ""
-    @State private var subject = ""
-    @State private var bodyText = ""
-    @State private var priority = 3
+    let seed: ComposeSeed
+
+    @State private var to: String
+    @State private var cc: String
+    @State private var bcc: String
+    @State private var subject: String
+    @State private var bodyText: String
+    @State private var priority: Int
     @State private var attachments: [URL] = []
     @State private var showImporter = false
     @State private var errorText: String?
+
+    init(seed: ComposeSeed = ComposeSeed()) {
+        self.seed = seed
+        _to = State(initialValue: seed.to)
+        _cc = State(initialValue: seed.cc)
+        _bcc = State(initialValue: seed.bcc)
+        _subject = State(initialValue: seed.subject)
+        _bodyText = State(initialValue: seed.body)
+        _priority = State(initialValue: seed.priority)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -147,7 +159,11 @@ struct ComposeView: View {
     private var account: Personality { model.settings.dominant }
 
     private var fromDisplay: String {
-        account.realName.isEmpty
+        if let address = seed.fromAddress {
+            let name = seed.fromName ?? ""
+            return name.isEmpty ? address : "\(name) <\(address)>"
+        }
+        return account.realName.isEmpty
             ? account.emailAddress
             : "\(account.realName) <\(account.emailAddress)>"
     }
@@ -157,15 +173,30 @@ struct ComposeView: View {
             errorText = "The message has no recipients."
             return nil
         }
+        var body = bodyText
+        // The classic signature: appended after "-- " for personalities
+        // that use one (SIG_INTRO), except on redirects.
+        if account.useSignature, seed.fromAddress == nil {
+            let sig = model.signatureText(named: account.signatureName)
+            if !sig.isEmpty {
+                if !body.hasSuffix("\n") { body += "\n" }
+                body += "\n-- \n" + sig
+            }
+        }
         let composer = Composer()
-            .from(name: account.realName, address: account.emailAddress)
+            .from(name: seed.fromAddress != nil ? (seed.fromName ?? "")
+                                                : account.realName,
+                  address: seed.fromAddress ?? account.emailAddress)
             .subject(subject)
-            .body(bodyText)
+            .body(body)
             .priority(priority)
             .header("X-Mailer", "Eudora (EudoraCore \(String(cString: eudora_core_version())))")
         if !to.isEmpty { composer.to(to) }
         if !cc.isEmpty { composer.cc(cc) }
         if !bcc.isEmpty { composer.bcc(bcc) }
+        for extra in seed.extraHeaders {
+            composer.header(extra.name, extra.value)
+        }
         for url in attachments {
             composer.attach(path: url.path)
         }
@@ -181,6 +212,9 @@ struct ComposeView: View {
     private func queue() {
         guard let built = buildMessage() else { return }
         model.queue(message: built.message)
+        if let original = seed.original {
+            model.markOriginal(original)
+        }
         dismiss()
     }
 
@@ -211,6 +245,7 @@ struct ComposeView: View {
                 failure = "\(error)"
             }
             let failureFinal = failure
+            let original = seed.original
             await MainActor.run {
                 if let failure = failureFinal {
                     model.statusText = "Send failed: \(failure)"
@@ -220,6 +255,9 @@ struct ComposeView: View {
                         _ = try? out.append(message: built.message, state: .sent)
                         try? out.save()
                         model.refreshMailbox(named: "Out")
+                    }
+                    if let original {
+                        model.markOriginal(original)
                     }
                     model.statusText = "Message sent."
                 }

@@ -89,12 +89,15 @@ struct MailboxPane: View {
         .contextMenu(forSelectionType: Int.self) { selection in
             messageContextMenu(selection: selection)
         } primaryAction: { selection in
-            // Double-click opens (classic behavior); mark read.
-            if let index = selection.first,
-               let mb = model.mailbox(named: mailboxName) {
-                mb.setState(.read, at: index)
-                try? mb.save()
-                model.mailboxGeneration += 1
+            // Double-click opens the message in its own window (classic).
+            if let index = selection.first {
+                openMessage(at: index)
+            }
+        }
+        .onDeleteCommand {
+            if let index = tableSelection.first {
+                model.delete(messageAt: index, from: mailboxName)
+                tableSelection.removeAll()
             }
         }
         .onChange(of: tableSelection) { newValue in
@@ -102,14 +105,39 @@ struct MailboxPane: View {
         }
     }
 
+    private func openMessage(at index: Int) {
+        guard let mb = model.mailbox(named: mailboxName),
+              let sum = mb.summary(at: index) else { return }
+        openWindow(id: "message",
+                   value: MessageRef(mailbox: mailboxName, index: index,
+                                     serial: sum.serialNumber))
+    }
+
+    @Environment(\.openWindow) private var openWindow
+
     @ViewBuilder
     private func messageContextMenu(selection: Set<Int>) -> some View {
         if let index = selection.first {
+            Button("Open") { openMessage(at: index) }
+            Divider()
+            Button("Reply") { compose(.reply, index) }
+            Button("Reply to All") { compose(.replyAll, index) }
+            Button("Forward") { compose(.forward, index) }
+            Button("Redirect") { compose(.redirect, index) }
+            Button("Send Again") { compose(.sendAgain, index) }
+            Divider()
             Menu("Status") {
                 statusButton("Unread", .unread, index)
                 statusButton("Read", .read, index)
                 statusButton("Replied", .replied, index)
                 statusButton("Forwarded", .forwarded, index)
+            }
+            Menu("Priority") {
+                ForEach(1..<6) { p in
+                    Button(["Highest", "High", "Normal", "Low", "Lowest"][p - 1]) {
+                        model.setPriority(p, messageAt: index, in: mailboxName)
+                    }
+                }
             }
             Menu("Label") {
                 ForEach(0..<model.settings.labels.count, id: \.self) { i in
@@ -134,11 +162,26 @@ struct MailboxPane: View {
                 }
             }
             Divider()
+            Button(mailboxName == "Junk" ? "Not Junk" : "Junk") {
+                model.markJunk(messageAt: index, from: mailboxName,
+                               junk: mailboxName != "Junk")
+                tableSelection.removeAll()
+            }
+            Button("Make Address Book Entry") {
+                model.makeAddressBookEntry(mailbox: mailboxName, index: index)
+            }
+            Divider()
             Button("Delete", role: .destructive) {
                 model.delete(messageAt: index, from: mailboxName)
                 tableSelection.removeAll()
             }
         }
+    }
+
+    private func compose(_ kind: AppModel.ComposeActionKind, _ index: Int) {
+        guard let seed = model.composeSeed(kind, mailbox: mailboxName,
+                                           index: index) else { return }
+        openWindow(id: "compose", value: seed)
     }
 
     private func statusButton(_ title: String, _ state: MessageState,

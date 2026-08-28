@@ -87,6 +87,8 @@ final class AppModel: ObservableObject {
 
     @Published var mailboxNames: [String] = []
     @Published var selectedMailbox: String? = "In"
+    /// Selected row in the current mailbox's table (menu commands act on it).
+    @Published var selectedMessage: Int?
     @Published var statusText: String = "Welcome to Eudora."
     @Published var isCheckingMail = false
     @Published var settings = EudoraSettings()
@@ -216,6 +218,199 @@ final class AppModel: ObservableObject {
         try? mb.compact()
         refreshMailbox(named: name)
         statusText = "Compacted \(name)."
+    }
+
+    // MARK: message actions (Reply / Forward / Redirect / Send Again)
+
+    enum ComposeActionKind {
+        case reply, replyAll, forward, redirect, sendAgain
+    }
+
+    /// Builds the composition seed for a message action, or nil when the
+    /// message can't be read.
+    func composeSeed(_ kind: ComposeActionKind, mailbox boxName: String,
+                     index: Int) -> ComposeSeed? {
+        guard let mb = mailbox(named: boxName),
+              let sum = mb.summary(at: index),
+              let raw = try? mb.rawMessage(at: index),
+              let msg = try? ParsedMessage(raw: raw)
+        else { return nil }
+
+        var seed = ComposeSeed()
+        seed.priority = sum.priorityDisplay // PREF_NO_XF_PRIOR default
+        let subject = msg.decodedHeader("Subject")
+
+        switch kind {
+        case .reply, .replyAll:
+            seed.subject = subject.lowercased().hasPrefix("re:")
+                ? subject : "Re: " + subject
+            seed.body = quoted(msg, summary: sum)
+            if let msgID = msg.header("Message-Id") {
+                seed.extraHeaders.append(.init(name: "In-Reply-To", value: msgID))
+            }
+            if kind == .reply {
+                seed.to = msg.header("Reply-To") ?? msg.header("From") ?? sum.from
+            } else {
+                let (to, cc) = replyAllRecipients(of: msg)
+                seed.to = to
+                seed.cc = cc
+            }
+            seed.original = .init(mailbox: boxName, serial: sum.serialNumber,
+                                  markState: MessageState.replied.rawValue)
+
+        case .forward:
+            seed.subject = "Fwd: " + subject
+            seed.body = quoted(msg, summary: sum)
+            seed.original = .init(mailbox: boxName, serial: sum.serialNumber,
+                                  markState: MessageState.forwarded.rawValue)
+
+        case .redirect:
+            // The classic "(by way of)" From; body passes through verbatim.
+            seed.subject = subject
+            seed.body = normalizedBody(of: msg)
+            let account = settings.dominant
+            let me = account.realName.isEmpty ? account.emailAddress
+                                              : account.realName
+            let origName = displayName(ofFrom: msg) ?? sum.from
+            seed.fromName = "\(origName) (by way of \(me))"
+            seed.fromAddress =
+                bareAddresses(of: msg, header: "From").first ?? account.emailAddress
+            seed.original = .init(mailbox: boxName, serial: sum.serialNumber,
+                                  markState: MessageState.redistributed.rawValue)
+
+        case .sendAgain:
+            seed.to = msg.header("To") ?? ""
+            seed.cc = msg.header("Cc") ?? ""
+            seed.subject = subject
+            seed.body = normalizedBody(of: msg)
+        }
+        return seed
+    }
+
+    /// Marks the message a composition answered (replied/forwarded/…),
+    /// finding it by serial so transfers don't misfile the mark.
+    func markOriginal(_ ref: ComposeSeed.OriginalRef) {
+        guard let mb = mailbox(named: ref.mailbox),
+              let idx = mb.findBySerial(ref.serial) else { return }
+        mb.setState(MessageState(rawValue: ref.markState) ?? .replied, at: idx)
+        try? mb.save()
+        mailboxGeneration += 1
+    }
+
+    /// Attribution line + quote-prefixed body (QuoteLines + ATTRIBUTION).
+    private func quoted(_ msg: ParsedMessage, summary: MessageSummary) -> String {
+        let dateFmt = DateFormatter()
+        dateFmt.dateStyle = .medium
+        dateFmt.timeStyle = .none
+        let timeFmt = DateFormatter()
+        timeFmt.dateStyle = .none
+        timeFmt.timeStyle = .short
+        let from = msg.decodedHeader("From")
+        var attribution = settings.attributionTemplate
+        for (key, value) in [("{from}", from.isEmpty ? summary.from : from),
+                             ("{date}", dateFmt.string(from: summary.date)),
+                             ("{time}", timeFmt.string(from: summary.date)),
+                             ("{subject}", msg.decodedHeader("Subject"))] {
+            attribution = attribution.replacingOccurrences(of: key, with: value)
+        }
+        let prefix = settings.quotePrefix.isEmpty ? ">" : settings.quotePrefix
+        var body = normalizedBody(of: msg)
+        if body.hasSuffix("\n") { body.removeLast() }
+        let quotedLines = body
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { prefix + String($0) }
+            .joined(separator: "\n")
+        return attribution + "\n" + quotedLines + "\n"
+    }
+
+    private func normalizedBody(of msg: ParsedMessage) -> String {
+        msg.decodedBody
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+    }
+
+    private func bareAddresses(of msg: ParsedMessage, header: String) -> [String] {
+        parseAddresses(msg.header(header) ?? "")
+            .filter { !$0.isEmpty && $0 != ";" && !$0.hasSuffix(":") }
+    }
+
+    private func displayName(ofFrom msg: ParsedMessage) -> String? {
+        var name = msg.decodedHeader("From")
+        if let lt = name.firstIndex(of: "<") { name = String(name[..<lt]) }
+        name = name.trimmingCharacters(in: CharacterSet(charactersIn: " \t\""))
+        return name.isEmpty ? nil : name
+    }
+
+    /// Reply-All recipients: sender to To, everyone else to Cc, deduped,
+    /// dropping our own addresses unless the setting keeps them
+    /// (PREF_NOT_ME semantics).
+    private func replyAllRecipients(of msg: ParsedMessage) -> (to: String, cc: String) {
+        var toAddrs = bareAddresses(of: msg, header: "Reply-To")
+        if toAddrs.isEmpty { toAddrs = bareAddresses(of: msg, header: "From") }
+        var ccAddrs = bareAddresses(of: msg, header: "To") +
+            bareAddresses(of: msg, header: "Cc")
+        if !settings.replyAllIncludesSelf {
+            let own = Set(settings.personalities.map { $0.emailAddress.lowercased() }
+                .filter { !$0.isEmpty })
+            ccAddrs.removeAll { own.contains($0.lowercased()) }
+        }
+        var seen = Set(toAddrs.map { $0.lowercased() })
+        let cc = ccAddrs.filter { seen.insert($0.lowercased()).inserted }
+        return (toAddrs.joined(separator: ", "), cc.joined(separator: ", "))
+    }
+
+    /// Change a stored message's display priority (the Change > Priority menu).
+    func setPriority(_ display: Int, messageAt index: Int, in boxName: String) {
+        guard let mb = mailbox(named: boxName) else { return }
+        mb.setPriority(display: display, at: index)
+        try? mb.save()
+        mailboxGeneration += 1
+    }
+
+    /// Junk / Not Junk: assign the transfer score (or clear it) and move the
+    /// message to Junk (or back to In).  The score is stamped on the
+    /// destination copy — transfers rewrite the summary.
+    func markJunk(messageAt index: Int, from source: String, junk: Bool) {
+        let score = junk ? settings.junkXferScore : 0
+        let target = junk ? "Junk" : "In"
+        guard let src = mailbox(named: source) else { return }
+        if source == target {
+            src.setSpamScore(score, at: index)
+            try? src.save()
+            mailboxGeneration += 1
+            return
+        }
+        guard let dst = mailbox(named: target),
+              let raw = try? src.rawMessage(at: index),
+              let summary = src.summary(at: index),
+              let newIndex = try? dst.append(message: raw, state: summary.state)
+        else { return }
+        dst.setSpamScore(score, at: newIndex)
+        try? dst.save()
+        src.delete(at: index)
+        try? src.save()
+        mailboxGeneration += 1
+        statusText = junk ? "Marked as junk." : "Marked as not junk."
+    }
+
+    /// The classic Make Address Book Entry: file the sender as a nickname.
+    func makeAddressBookEntry(mailbox boxName: String, index: Int) {
+        guard let mb = mailbox(named: boxName),
+              let raw = try? mb.rawMessage(at: index),
+              let msg = try? ParsedMessage(raw: raw),
+              let address = bareAddresses(of: msg, header: "From").first
+        else { return }
+        var nickname = displayName(ofFrom: msg) ?? ""
+        if nickname.isEmpty || nickname.contains("@") {
+            nickname = String(address.prefix(while: { $0 != "@" }))
+        }
+        guard !nickname.isEmpty,
+              let book = (try? AddressBook(path: nicknamesURL.path))
+                  ?? (try? AddressBook(text: ""))
+        else { return }
+        book.set(name: nickname, addresses: address)
+        try? book.save(to: nicknamesURL.path)
+        statusText = "Added \(nickname) to the Address Book."
     }
 
     // MARK: network operations

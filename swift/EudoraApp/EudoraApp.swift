@@ -42,9 +42,20 @@ struct EudoraApp: App {
         }
         .commands { menuCommands }
 
-        Window("Composition", id: "compose") {
-            ComposeView()
+        // Value-based groups: each action opens a fresh window whose @State
+        // initializes from the value (a single Window scene cannot do this).
+        WindowGroup("Composition", id: "compose", for: ComposeSeed.self) { $seed in
+            ComposeView(seed: seed ?? ComposeSeed())
                 .environmentObject(model)
+        } defaultValue: {
+            ComposeSeed()
+        }
+
+        WindowGroup("Message", id: "message", for: MessageRef.self) { $ref in
+            if let ref {
+                MessageWindow(reference: ref)
+                    .environmentObject(model)
+            }
         }
 
         Window("Filters", id: "filters") {
@@ -77,12 +88,59 @@ struct EudoraApp: App {
             Button("Send Queued Messages") { model.sendQueuedMessages() }
                 .keyboardShortcut("t", modifiers: [.command])
             Divider()
+            Button("Reply") { composeFromSelection(.reply) }
+                .keyboardShortcut("r", modifiers: [.command])
+                .disabled(model.selectedMessage == nil)
+            Button("Reply to All") { composeFromSelection(.replyAll) }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(model.selectedMessage == nil)
+            Button("Forward") { composeFromSelection(.forward) }
+                .disabled(model.selectedMessage == nil)
+            Button("Redirect") { composeFromSelection(.redirect) }
+                .disabled(model.selectedMessage == nil)
+            Button("Send Again") { composeFromSelection(.sendAgain) }
+                .disabled(model.selectedMessage == nil)
+            Divider()
+            Menu("Change Priority") {
+                ForEach(1..<6) { p in
+                    Button(["Highest", "High", "Normal", "Low", "Lowest"][p - 1]) {
+                        if let box = model.selectedMailbox,
+                           let index = model.selectedMessage {
+                            model.setPriority(p, messageAt: index, in: box)
+                        }
+                    }
+                }
+            }
+            .disabled(model.selectedMessage == nil)
+            Button("Junk") { junkSelection(true) }
+                .keyboardShortcut("j", modifiers: [.command, .shift])
+                .disabled(model.selectedMessage == nil)
+            Button("Not Junk") { junkSelection(false) }
+                .disabled(model.selectedMessage == nil)
+            Button("Make Address Book Entry") {
+                if let box = model.selectedMailbox,
+                   let index = model.selectedMessage {
+                    model.makeAddressBookEntry(mailbox: box, index: index)
+                }
+            }
+            .keyboardShortcut("k", modifiers: [.command])
+            .disabled(model.selectedMessage == nil)
+            Divider()
             Button("Filter Messages") {
                 if let box = model.selectedMailbox {
                     model.runFilters(on: box)
                 }
             }
             .keyboardShortcut("j", modifiers: [.command])
+            Button("Delete") {
+                if let box = model.selectedMailbox,
+                   let index = model.selectedMessage {
+                    model.delete(messageAt: index, from: box)
+                    model.selectedMessage = nil
+                }
+            }
+            .keyboardShortcut(.delete, modifiers: [.command])
+            .disabled(model.selectedMessage == nil)
         }
 
         CommandMenu("Special") {
@@ -100,6 +158,21 @@ struct EudoraApp: App {
     }
 
     @Environment(\.openWindow) private var openWindow
+
+    private func composeFromSelection(_ kind: AppModel.ComposeActionKind) {
+        guard let box = model.selectedMailbox,
+              let index = model.selectedMessage,
+              let seed = model.composeSeed(kind, mailbox: box, index: index)
+        else { return }
+        openWindow(id: "compose", value: seed)
+    }
+
+    private func junkSelection(_ junk: Bool) {
+        guard let box = model.selectedMailbox,
+              let index = model.selectedMessage else { return }
+        model.markJunk(messageAt: index, from: box, junk: junk)
+        model.selectedMessage = nil
+    }
 }
 
 #else

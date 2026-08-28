@@ -10,7 +10,6 @@ import SwiftUI
 
 struct MainWindow: View {
     @EnvironmentObject var model: AppModel
-    @State private var selectedMessage: Int?
     @State private var newMailboxPrompt = false
     @State private var newMailboxName = ""
 
@@ -19,7 +18,9 @@ struct MainWindow: View {
             sidebar
         } detail: {
             if let boxName = model.selectedMailbox {
-                MailboxPane(mailboxName: boxName, selectedMessage: $selectedMessage)
+                // Selection lives on the model so menu commands can act on it.
+                MailboxPane(mailboxName: boxName,
+                            selectedMessage: $model.selectedMessage)
                     .navigationTitle(boxName)
             } else {
                 Text("Select a mailbox")
