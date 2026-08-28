@@ -1,5 +1,7 @@
 # Porting Eudora 6.2.4 to Apple Silicon
 
+[![CI](https://github.com/boydj/eudora4mac/actions/workflows/ci.yml/badge.svg)](https://github.com/boydj/eudora4mac/actions/workflows/ci.yml)
+
 This repository contains the original QUALCOMM / Computer History Museum
 source of **Eudora 6.2.4 for Mac** (Carbon, PowerPC, CodeWarrior) plus a
 new, modern extraction of its core business logic in [`core/`](core/):
@@ -31,6 +33,29 @@ ctest --test-dir build        # 9 suites, all platform-independent
   non-Apple platforms it is the only TLS option.
 - **Linux**: the same tree builds and the full test suite runs; that is how
   the port is verified in CI-like environments.
+
+### CI/CD (GitHub Actions)
+
+- **CI** (`.github/workflows/ci.yml`), on pushes and pull requests:
+  the core builds and its full ctest suite runs on both `ubuntu-latest`
+  and `macos-latest`, and the SwiftPM app builds (debug + release) on
+  macOS.  Each run packages a ready-to-run **Eudora.app** and uploads it
+  as the `Eudora-app` artifact.
+- **Release** (`.github/workflows/release.yml`): pushing a `v*` tag
+  builds and packages the app and attaches the zip to a GitHub Release.
+- **Packaging** (`packaging/make_app_bundle.sh`) also works locally:
+
+  ```sh
+  swift build -c release
+  bash packaging/make_app_bundle.sh          # -> dist/Eudora.app + zip
+  ```
+
+  The bundle is **ad-hoc signed** (no Developer ID in CI): on another
+  machine, right-click → Open the first launch, or clear quarantine with
+  `xattr -d com.apple.quarantine Eudora.app`.  Real distribution needs a
+  Developer ID certificate + notarization (the script marks where they
+  slot in).  Bundled builds also enable the real notification-center
+  path that bare `swift run` builds cannot use.
 
 ## The app — the classic UI, rebuilt
 

@@ -1,0 +1,30 @@
+# Release: on a v* tag, build the app, package Eudora.app, and attach
+# the zip to a GitHub Release.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release Eudora.app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (release)
+        run: swift build -c release
+      - name: Package Eudora.app
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash packaging/make_app_bundle.sh .build/release dist "$VERSION"
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

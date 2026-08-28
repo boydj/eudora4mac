@@ -1,0 +1,72 @@
+# CI for the modernized Eudora: the C++ core (CMake + ctest) on Linux and
+# macOS, and the SwiftPM app build + Eudora.app packaging on macOS.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "claude/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-linux:
+    name: Core (Linux, cmake + ctest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -S core -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  core-macos:
+    name: Core (macOS, cmake + ctest)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        # The CMake defaults the deployment target to 26.0 only when
+        # unset; pin the runner SDK's floor (matches Package.swift).
+        run: >
+          cmake -B build -S core -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  app-macos:
+    name: App (macOS, swift build + package)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Build (debug)
+        run: swift build
+      - name: Build (release)
+        run: swift build -c release
+      - name: Package Eudora.app
+        run: >
+          bash packaging/make_app_bundle.sh .build/release dist
+          "0.0.0-ci.${{ github.run_number }}+${GITHUB_SHA:0:7}"
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eudora-app
+          path: dist/*.zip
+          retention-days: 14
+          if-no-files-found: error
