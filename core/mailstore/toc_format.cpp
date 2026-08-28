@@ -148,7 +148,9 @@ std::optional<TableOfContents> decode(std::span<const std::uint8_t> image,
 
     const std::uint32_t flagWord = r.u32(hdr::flagBits);
     toc.imap = cw_bits(flagWord, hdrbits::imapTOC, 1) != 0;
-    toc.virtual_box = cw_bits(flagWord, hdrbits::virtualTOC, 1) != 0;
+    // Legacy CleanseTOC forces virtualTOC false on every load (toc.c:1233);
+    // a virtual mailbox is reconstructed at runtime, never trusted from disk.
+    toc.virtual_box = false;
 
     toc.minor_version = r.i16(hdr::minorVersion);
     toc.which = static_cast<MailboxKind>(r.i16(hdr::which));
@@ -174,19 +176,28 @@ std::optional<TableOfContents> decode(std::span<const std::uint8_t> image,
         const std::size_t base = kHeaderSize + static_cast<std::size_t>(i) * kSummarySize;
         MessageSummary s = decode_summary(r, base);
 
-        // InsaneTOC per-summary checks (toc.c:969-979).
-        const bool imap_placeholder = toc.imap && s.offset < 0;
+        // CleanseTOC: an unset arrival time falls back to the Date: seconds
+        // (toc.c:1223) so junk aging / leave-on-server windows have a value.
+        if (!s.arrival_seconds)
+            s.arrival_seconds = s.seconds;
+
+        // InsaneTOC per-summary checks (toc.c:969-979).  For an IMAP TOC the
+        // whole offset/length-vs-file-size test is skipped (toc.c:973's
+        // `&& !imapTOC`): its summaries point into a server mailbox, not the
+        // local file, so negative offsets are placeholders and positive ones
+        // need not fit the local size.
         if ((s.offset < 0 && !toc.imap) || s.length < 0 || s.body_offset < 0 ||
             s.body_offset > s.length ||
-            (mailbox_size >= 0 && !imap_placeholder &&
+            (mailbox_size >= 0 && !toc.imap &&
              static_cast<std::int64_t>(s.offset) + s.length > mailbox_size))
             return fail(TocError::BadSummaryRange);
 
         toc.sums.push_back(std::move(s));
     }
 
-    // InsaneTOC boxSize check (toc.c:953): stored boxSize is size+1.
-    if (mailbox_size >= 0 && toc.box_size &&
+    // InsaneTOC boxSize check (toc.c:953): stored boxSize is size+1.  Also
+    // skipped for IMAP TOCs, whose boxSize does not track the local file.
+    if (mailbox_size >= 0 && !toc.imap && toc.box_size &&
         static_cast<std::int64_t>(toc.box_size) - 1 != mailbox_size)
         return fail(TocError::BadSummaryRange);
 

@@ -80,22 +80,36 @@ long local_zone_seconds() {
 }
 
 long tz_name_to_offset(std::string_view name) {
-    // Classic RFC 822 zone names (the original consulted a resource table
-    // with the same content).
+    // Named zones from the legacy 'zon#' resource (id 1001, read by
+    // TZName2Offset, util.c:2357).  The original shipped all of these, not
+    // just the North-American set — a Date: … JST header must resolve to
+    // +9h, not be treated as local time.  (Legacy truncated a few of these
+    // offsets through a `short index`, yielding nonsense values for the
+    // far-east zones; that is a bug we deliberately do not reproduce, so we
+    // use the real offsets in minutes.)
     struct Zone {
         const char *name;
-        long hours;
+        long minutes;
     };
     static constexpr Zone kZones[] = {
-        {"UT", 0},   {"GMT", 0},  {"EST", -5}, {"EDT", -4}, {"CST", -6},
-        {"CDT", -5}, {"MST", -7}, {"MDT", -6}, {"PST", -8}, {"PDT", -7},
+        {"UT", 0},      {"UTC", 0},    {"GMT", 0},
+        {"EST", -300},  {"EDT", -240}, {"CST", -360}, {"CDT", -300},
+        {"MST", -420},  {"MDT", -360}, {"PST", -480}, {"PDT", -420},
+        {"HST", -600},                                       // Hawaii
+        {"MET", 60},    {"MEZ", 60},   {"MET DST", 120},     // Central Europe
+        {"BST", 60},    {"HOE", 60},   {"DNT", 60},          // +1 zones
+        {"IDT", 180},                                        // Israel DST
+        {"SST", 480},                                        // +8
+        {"WST", 540},   {"JST", 540},  {"KST", 540},         // +9
+        {"AEST", 600},                                       // +10
+        {"NZD", 780},                                        // +13
     };
     std::string upper;
     for (char c : name)
         upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     for (const auto &z : kZones)
         if (upper == z.name)
-            return z.hours * 3600;
+            return z.minutes * 60;
     return 0;
 }
 

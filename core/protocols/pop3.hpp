@@ -62,6 +62,9 @@ public:
     // the transport and then MUST call rescan_capabilities().  On failure
     // the input is flushed (the Cyrus workaround, pop.c:532).
     bool request_stls();
+    // Drain the bogus reply Cyrus queues when TLS fails to engage after a
+    // successful STLS (call only in that case, pop.c:527-533).
+    void flush_after_failed_tls();
     void rescan_capabilities() { query_capabilities(); }
 
     // Log in (POPIntroductions' auth ladder).

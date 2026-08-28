@@ -31,9 +31,15 @@ std::uint32_t mid_hash(std::string_view message_id) {
     // MIDHash ran the header through the address parser and hashed the first
     // address token — for "<abc@def>" that is "abc@def" (message.c:4578).
     auto addrs = parse_addresses(message_id, false);
-    if (!addrs || addrs->empty() || addrs->front().empty())
+    if (!addrs) // genuine parse failure (SuckPtrAddresses returned nil)
         return kNoMessageIdHash;
-    std::string id = addrs->front();
+    // Legacy hashed the first token even when it was empty: SuckPtrAddresses
+    // returned a non-nil (possibly empty) handle, so an empty or
+    // comment-only Message-Id hashed Hash("") == 1 — a *valid* hash, which
+    // is what lets two empty-Message-Id messages dedup against each other
+    // (message.c:4585-4590).  Returning kNoMessageId here instead would
+    // silently break that.
+    std::string id = addrs->empty() ? std::string() : addrs->front();
     // The legacy path went through a Str255, so at most 255 bytes are hashed.
     if (id.size() > 255)
         id.resize(255);

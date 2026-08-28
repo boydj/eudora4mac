@@ -727,8 +727,12 @@ int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
             set_error("server refused STLS: " + pop.last_response());
             return -1;
         }
-        if (!bundle.start_tls(host))
+        if (!bundle.start_tls(host)) {
+            // STLS was accepted but the handshake did not engage: drain the
+            // bogus reply Cyrus leaves behind before giving up.
+            pop.flush_after_failed_tls();
             return -1;
+        }
         pop.rescan_capabilities();
     }
     if (!report("auth", 0, 0))

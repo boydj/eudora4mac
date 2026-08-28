@@ -124,12 +124,17 @@ const Pop3Capabilities &Pop3Session::query_capabilities() {
 }
 
 bool Pop3Session::request_stls() {
-    if (command("STLS"))
-        return true;
-    // Cyrus sends a bogus -ERR to the NEXT command after a failed TLS
-    // negotiation; flush it (pop.c:527-533).
+    // Just issue the command.  A -ERR here (STLS not offered) is NOT the
+    // Cyrus case and must not flush — legacy only flushed after a +OK whose
+    // TLS handshake then failed to engage (pop.c:514-532), which is the
+    // caller's job once start_tls() fails.
+    return command("STLS");
+}
+
+void Pop3Session::flush_after_failed_tls() {
+    // Cyrus leaves a bogus reply queued when TLS did not engage after a
+    // successful STLS; drain it (pop.c:527-533).
     transport_.flush_input(2);
-    return false;
 }
 
 bool Pop3Session::login(const std::string &user, const std::string &password,

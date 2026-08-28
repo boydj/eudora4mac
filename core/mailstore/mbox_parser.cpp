@@ -8,6 +8,7 @@
 
 #include "compat/hashes.hpp"
 #include "compat/macdate.hpp"
+#include "mail/address_parser.hpp"
 #include "mail/rfc2047.hpp"
 #include "mailstore/toc_format.hpp"
 
@@ -129,9 +130,10 @@ constexpr int kToHead = 1;
 constexpr std::array<std::string_view, 2> kBulkHeaderPrefixes = {"errors-to:",
                                                                 "list-"};
 
-// Daemon list (STR# 30900) for IsBulk.
-constexpr std::array<std::string_view, 4> kDaemons = {"daemon", "listserv",
-                                                      "listproc", "majordomo"};
+// Daemon list (STR# 30900) for IsBulk: "daemon, listserv, listproc,
+// majordomo, owner-" ('TEXT' 1001).
+constexpr std::array<std::string_view, 5> kDaemons = {
+    "daemon", "listserv", "listproc", "majordomo", "owner-"};
 
 // ImportanceStrn (STR# 28300).
 constexpr std::array<std::string_view, 5> kImportance = {"Highest", "High",
@@ -145,12 +147,17 @@ constexpr std::string_view kXRichTag = "x-rich";
 constexpr std::string_view kXFlowedTag = "x-flowed";
 constexpr std::string_view kXCharsetTag = "x-charset";
 
-// IsBulk (buildtoc.c:637), simplified: the header's addresses are checked
-// for the well-known daemon substrings.
-bool is_bulk_sender(std::string_view header_line) {
-    for (auto d : kDaemons)
-        if (icontains(header_line, d))
-            return true;
+// IsBulk (buildtoc.c:637): the sender's parsed ADDRESSES are checked for the
+// well-known daemon substrings — not the raw header line, so a human named
+// "John Daemon <j@x.com>" is not mistaken for a mailing list.
+bool is_bulk_sender(std::string_view header_value) {
+    auto addrs = parse_addresses(header_value, false);
+    if (!addrs)
+        return false;
+    for (const auto &a : *addrs)
+        for (auto d : kDaemons)
+            if (icontains(a, d))
+                return true;
     return false;
 }
 
@@ -436,25 +443,34 @@ static std::string trim_wrap(std::string s, char open_c, char close_c) {
 }
 
 std::string beautify_from(std::string_view from0) {
-    std::string from(trim_white(trim_terminator(from0)));
-    const bool was_not_empty = !from.empty();
+    // wasNotEmpty is measured before the whitespace trim (buildtoc.c:1214),
+    // so a whitespace-only From still becomes "Unspecified".
+    std::string raw(trim_terminator(from0));
+    const bool was_not_empty = !raw.empty();
+    std::string from(trim_white(raw));
 
     // Elide everything after the last '<' unless it's the first character.
+    bool elided = false;
     if (!from.empty() && from.front() != '<') {
         const auto lt = from.find_last_of('<');
         if (lt != std::string::npos) {
             from = from.substr(0, lt);
-        } else if (from.front() != '"') {
-            // No phrase; prefer parenthesized text.
-            const auto op = from.find('(');
-            if (op != std::string::npos) {
-                const auto cl = from.find(')', op + 1);
-                if (cl != std::string::npos) {
-                    const std::string inner = from.substr(op + 1, cl - op - 1);
-                    // Skip 3-digit comments (looks like a phone extension).
-                    if (!inner.empty() && !(inner.size() == 3 && all_digits(inner)))
-                        from = inner;
-                }
+            elided = true;
+        }
+    }
+    // No phrase before the address: prefer parenthesized text.  This runs
+    // even when the value starts with '<' (legacy's else-if only required
+    // the elide branch not to fire, buildtoc.c:1219), so "<a@b> (Joe)"
+    // yields "Joe".
+    if (!elided && !from.empty() && from.front() != '"') {
+        const auto op = from.find('(');
+        if (op != std::string::npos) {
+            const auto cl = from.find(')', op + 1);
+            if (cl != std::string::npos) {
+                const std::string inner = from.substr(op + 1, cl - op - 1);
+                // Skip 3-digit comments (looks like a phone extension).
+                if (!inner.empty() && !(inner.size() == 3 && all_digits(inner)))
+                    from = inner;
             }
         }
     }
@@ -474,12 +490,13 @@ std::string beautify_subject(std::string_view subject0, bool outlook_fix) {
     struct Fix {
         std::string_view crap, treasure;
     };
-    static constexpr Fix kFixes[] = {{"RE:", "Re:"}, {"FW:", "Fwd:"}};
+    static constexpr Fix kFixes[] = {{"re:", "Re:"}, {"fw:", "Fwd:"}};
     for (const auto &f : kFixes) {
-        // The original matched case-SENSITIVELY (StartsWith uses memcmp), so
-        // only the all-caps Outlook forms are rewritten.
+        // The original matched case-INSENSITIVELY (StartsWith uses striscmp,
+        // stringutil.c:314), so "re:", "Re:", "fw:", "Fw:" are all rewritten
+        // to the canonical "Re:" / "Fwd:".
         if (subject.size() >= f.crap.size() &&
-            subject.compare(0, f.crap.size(), f.crap) == 0)
+            iequals(std::string_view(subject).substr(0, f.crap.size()), f.crap))
             subject = std::string(f.treasure) + subject.substr(f.crap.size());
     }
     return subject;
@@ -708,7 +725,8 @@ bool MboxScanner::next(MessageSummary &out) {
                     if (!options_.is_out) {
                         const int sh = find_sender_head(header_name);
                         if (sh) {
-                            if (!(sum.opts & sumopt::kBulk) && is_bulk_sender(line))
+                            if (!(sum.opts & sumopt::kBulk) &&
+                                is_bulk_sender(header_value(line)))
                                 sum.opts |= sumopt::kBulk;
                             if (sh <= sender_head) {
                                 sum.from = beautify_from(decode_rfc2047(header_value(line)));
@@ -727,10 +745,19 @@ bool MboxScanner::next(MessageSummary &out) {
                     break;
                 }
             } else if (header_index == tchSubject) {
-                // Continuation of a wrapped Subject: line.
+                // Continuation of a wrapped Subject: line.  Legacy kept the
+                // fold as a separating space (CtoPCpy + tab->space +
+                // trailing-only trim, buildtoc.c:528), so
+                // "Hello\r\n\tWorld" is "Hello World", not "HelloWorld".
+                // The Outlook prefix fix only applies to the first line.
                 std::string cont(trim_white(trim_terminator(line)));
                 std::replace(cont.begin(), cont.end(), '\t', ' ');
-                sum.subject += beautify_subject(decode_rfc2047(cont), options_.outlook_fix);
+                cont = decode_rfc2047(cont);
+                if (!cont.empty()) {
+                    if (!sum.subject.empty())
+                        sum.subject += ' ';
+                    sum.subject += cont;
+                }
             }
             continue;
         }

@@ -64,14 +64,36 @@ TEST_CASE("beautify_from") {
     CHECK_EQ(beautify_from("bob@example.org (Bob Builder)"), "Bob Builder");
     CHECK_EQ(beautify_from("<plain@addr.example>"), "<plain@addr.example>");
     CHECK_EQ(beautify_from("\"Quoted Name\" <q@example.com>"), "Quoted Name");
-    CHECK_EQ(beautify_from("   "), "");
+    // A whitespace-only From was non-empty before trimming, so it becomes
+    // SOME_BOZO "Unspecified" (buildtoc.c:1214).
+    CHECK_EQ(beautify_from("   "), "Unspecified");
+    // The parenthesized-name branch runs even when the value starts with '<'.
+    CHECK_EQ(beautify_from("<orig@x.com> (Joe)"), "Joe");
 }
 
 TEST_CASE("beautify_subject fixes Outlookisms") {
     CHECK_EQ(beautify_subject("RE: hello"), "Re: hello");
     CHECK_EQ(beautify_subject("FW: hello"), "Fwd: hello");
+    // The legacy match is case-INSENSITIVE (striscmp).
+    CHECK_EQ(beautify_subject("re: hello"), "Re: hello");
+    CHECK_EQ(beautify_subject("Fw: hello"), "Fwd: hello");
     CHECK_EQ(beautify_subject("Re: hello"), "Re: hello"); // already fine
+    CHECK_EQ(beautify_subject("Fwd: hello"), "Fwd: hello"); // not double-fixed
     CHECK_EQ(beautify_subject("RE: x", false), "RE: x");  // pref off
+}
+
+TEST_CASE("beautify_date honors named far-east zones") {
+    // JST is in the classic 'zon#' table (+9h); it must not be treated as
+    // local time.  The zone is reported in seconds east of UTC.
+    long jz = 0;
+    beautify_date("Mon, 1 Jan 2001 09:00:00 JST", jz);
+    CHECK_EQ(jz, 9 * 3600);
+    long nz = 0;
+    beautify_date("Mon, 1 Jan 2001 00:00:00 NZD", nz);
+    CHECK_EQ(nz, 13 * 3600);
+    long hz = 0;
+    beautify_date("Mon, 1 Jan 2001 00:00:00 HST", hz);
+    CHECK_EQ(hz, -10 * 3600);
 }
 
 TEST_CASE("beautify_date parses RFC822 dates") {
@@ -107,7 +129,11 @@ TEST_CASE("kr_hash matches legacy algorithm shape") {
     CHECK(h1 != h2);
     CHECK_EQ(mid_hash("<123.abc@example.com>"), h1);
     CHECK_EQ(mid_hash("(comment) <123.abc@example.com>"), h1);
-    CHECK_EQ(mid_hash(""), 0xFFFFFFFFu);
+    // Legacy MIDHash hashed an empty first token as Hash("") == 1 (a valid
+    // hash), so empty/comment-only Message-Ids dedup against each other.
+    CHECK_EQ(mid_hash(""), 1u);
+    CHECK_EQ(mid_hash("(only a comment)"), 1u);
+    CHECK_EQ(kr_hash(""), 1u);
 }
 
 TEST_CASE("mbox parsing builds correct summaries") {
@@ -134,7 +160,8 @@ TEST_CASE("mbox parsing builds correct summaries") {
 
     const auto &s2 = toc->sums[1];
     CHECK_EQ(s2.from, "Bob Builder");
-    CHECK_EQ(s2.subject, "found itcontinued subject");
+    // A folded Subject keeps a separating space (buildtoc.c:528).
+    CHECK_EQ(s2.subject, "found it continued subject");
     CHECK(s2.serial_num == 2);
 
     // Offsets tile the file exactly.
