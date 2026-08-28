@@ -59,7 +59,13 @@ bool write_toc(const TableOfContents &toc, const fs::path &toc_file) {
             mailbox_size = static_cast<std::int64_t>(sz);
         const auto mtime = fs::last_write_time(toc.mailbox_path, ec);
         if (!ec) {
-            const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(mtime);
+            // Apple's libc++ lacks std::chrono::clock_cast; convert the
+            // file-clock time via the two clocks' current readings.
+            const auto file_now = fs::file_time_type::clock::now();
+            const auto sys_now = std::chrono::system_clock::now();
+            const auto sys =
+                sys_now + std::chrono::duration_cast<
+                              std::chrono::system_clock::duration>(mtime - file_now);
             const auto unix_secs =
                 std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch())
                     .count();

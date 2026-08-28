@@ -333,6 +333,7 @@ void eudora_addresses_free(char **addresses) {
 
 /* ---- POP3 -------------------------------------------------------------- */
 
+extern "C++" {
 namespace {
 
 struct TransportBundle {
@@ -404,6 +405,7 @@ std::string envelope_from_line(const HeaderSet &hs) {
 }
 
 } // namespace
+} // extern "C++"
 
 int32_t eudora_mailbox_append_message(eudora_mailbox *mb, const char *raw,
                                       size_t len, uint8_t state) {
@@ -850,6 +852,7 @@ int32_t eudora_filters_count(const eudora_filters *f) {
     return f ? static_cast<int32_t>(f->filters.size()) : 0;
 }
 
+extern "C++" {
 namespace {
 
 Filter *filter_at_mut(eudora_filters *f, int32_t index) {
@@ -894,6 +897,7 @@ const char *conjunction_cstr(FilterConjunction c) {
 }
 
 } // namespace
+} // extern "C++"
 
 int eudora_filters_get(const eudora_filters *f, int32_t index,
                        eudora_filter_info *out) {
