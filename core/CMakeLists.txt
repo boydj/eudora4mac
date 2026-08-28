@@ -59,7 +59,13 @@ target_sources(eudora_core PRIVATE
   mail/rfc2047.cpp
   mail/lex822.cpp
   mail/header_parser.cpp
-  mail/address_parser.cpp)
+  mail/address_parser.cpp
+  net/line_receiver.cpp
+  net/posix_transport.cpp
+  protocols/md5.c
+  protocols/sasl.cpp
+  protocols/pop3.cpp
+  protocols/smtp.cpp)
 
 if(EUDORA_ENABLE_TLS)
   find_package(OpenSSL QUIET)

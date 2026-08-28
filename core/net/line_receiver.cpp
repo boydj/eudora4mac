@@ -1,0 +1,54 @@
+#include "net/line_receiver.hpp"
+
+namespace eudora {
+
+NetError LineReceiver::recv_line(std::string &line, std::size_t max_len) {
+    line.clear();
+    NetError err = NetError::None;
+
+    while (line.size() < max_len) {
+        if (spot_ >= 0) {
+            // Drain buffered characters (ph.c:3071-3092).
+            bool hit_newline = false;
+            while (spot_ < filled_ && line.size() < max_len) {
+                const char c = buffer_[static_cast<std::size_t>(spot_++)];
+                if (c == '\0' || c == '\r')
+                    continue; // NULs and bare CRs dropped
+                if (c == '\n') {
+                    line += '\r'; // LF terminates; canonicalize to CR
+                    hit_newline = true;
+                    break;
+                }
+                line += c;
+            }
+            if (spot_ >= filled_)
+                spot_ = -1; // buffer emptied
+            if (hit_newline || line.size() >= max_len)
+                return NetError::None;
+        } else {
+            if (transport_.cancelled())
+                return NetError::Cancelled;
+            const long count =
+                transport_.recv(buffer_.data(), static_cast<long>(buffer_.size()));
+            if (count <= 0) {
+                err = count == 0 ? NetError::Closed : transport_.last_error();
+                if (err == NetError::None)
+                    err = NetError::IoError;
+                break;
+            }
+            // TREAT_BODY_CR_AS_CRLF (ph.c:3105-3121): bare CR from broken
+            // servers becomes a line break.  Sloppy at buffer boundaries,
+            // exactly like the original ("ASK ME IF I CARE!!!!").
+            for (long i = 0; i < count - 1; ++i)
+                if (buffer_[static_cast<std::size_t>(i)] == '\r' &&
+                    buffer_[static_cast<std::size_t>(i + 1)] != '\n')
+                    buffer_[static_cast<std::size_t>(i)] = '\n';
+            filled_ = count;
+            spot_ = 0;
+        }
+    }
+
+    return line.empty() ? err : NetError::None;
+}
+
+} // namespace eudora
