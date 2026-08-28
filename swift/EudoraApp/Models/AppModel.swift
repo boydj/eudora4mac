@@ -41,6 +41,8 @@ final class AppModel: ObservableObject {
         bootstrapMailFolder()
         reloadMailboxes()
         settings = EudoraSettings.load(from: settingsURL)
+        refreshAutoCheck()
+        updateDockBadge()
     }
 
     var settingsURL: URL { mailFolder.appendingPathComponent("EudoraSettings.json") }
@@ -104,6 +106,8 @@ final class AppModel: ObservableObject {
         bootstrapMailFolder()
         settings = EudoraSettings.load(from: settingsURL)
         reloadMailboxes()
+        refreshAutoCheck()
+        updateDockBadge()
     }
 
     // MARK: mailbox management
@@ -158,6 +162,9 @@ final class AppModel: ObservableObject {
     func refreshMailbox(named name: String) {
         openMailboxes[name] = nil
         mailboxGeneration += 1
+        if name == "In" {
+            updateDockBadge()
+        }
     }
 
     func newMailbox(named name: String) {
@@ -417,12 +424,16 @@ final class AppModel: ObservableObject {
 
     private let checkMailCancel = CancelFlag()
 
-    func checkMail() {
+    func checkMail(auto: Bool = false) {
         guard !isCheckingMail else { return }
         let account = settings.dominant
         guard !account.popHost.isEmpty else {
-            statusText = "Set up a personality in Settings first."
+            if !auto { statusText = "Set up a personality in Settings first." }
             return
+        }
+        // PREF_SEND_CHECK: queued mail goes out with every check.
+        if settings.sendOnCheck {
+            sendQueuedMessages(quiet: true)
         }
         isCheckingMail = true
         statusText = "Checking mail at \(account.popHost)…"
@@ -446,6 +457,10 @@ final class AppModel: ObservableObject {
                                       password: account.password,
                                       mailboxPath: inboxPath,
                                       deleteFromServer: !account.leaveOnServer,
+                                      maxMessageK: account.skipBigMessages
+                                          ? account.bigMessageLimitK : 0,
+                                      leaveOnServerDays: account.leaveOnServer
+                                          ? account.leaveOnServerDays : 0,
                                       progress: { stage, done, total in
                     let text: String
                     switch stage {
@@ -475,9 +490,9 @@ final class AppModel: ObservableObject {
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isCheckingMail = false
-                self.refreshMailbox(named: "In")
                 switch result {
                 case .success(let n):
+                    self.postCheckPipeline(newCount: wasStopped ? 0 : n)
                     if wasStopped {
                         self.statusText = n == 0 ? "Mail check stopped."
                             : "Mail check stopped after \(n) message\(n == 1 ? "" : "s")."
@@ -486,7 +501,84 @@ final class AppModel: ObservableObject {
                             : "You have \(n) new message\(n == 1 ? "" : "s")."
                     }
                 case .failure(let error):
+                    self.refreshMailbox(named: "In")
                     self.statusText = "Check failed: \(error)"
+                }
+            }
+        }
+    }
+
+    /// After a successful check: refresh, filter, sweep junk, and get the
+    /// user's attention — the classic end-of-POP pipeline.
+    private func postCheckPipeline(newCount: Int) {
+        refreshMailbox(named: "In")
+        runFilters(on: "In", event: .incoming, quiet: true)
+        junkSweep()
+        junkAging()
+        if newCount > 0 {
+            NewMailAttention.notify(count: newCount, settings: settings)
+            if settings.openMailboxOnNewMail {
+                selectedMailbox = "In"
+            }
+        }
+        updateDockBadge()
+    }
+
+    /// FilterJunk/MoveToJunk: everything in In scoring at or above the junk
+    /// threshold moves to the Junk mailbox.
+    private func junkSweep() {
+        guard let inbox = mailbox(named: "In") else { return }
+        let threshold = settings.junkThreshold
+        let junky = inbox.summaries
+            .filter { $0.spamScore >= threshold }
+            .map(\.index)
+        for index in junky.sorted(by: >) {
+            transfer(messageAt: index, from: "In", to: "Junk")
+        }
+    }
+
+    /// ArchiveJunk: junk older than the empty-after window goes to Trash.
+    private func junkAging() {
+        guard settings.junkEmptyAfterDays > 0,
+              let junk = mailbox(named: "Junk") else { return }
+        let cutoff = Date().addingTimeInterval(
+            -Double(settings.junkEmptyAfterDays) * 86400)
+        let old = junk.summaries
+            .filter { $0.arrival < cutoff }
+            .map(\.index)
+        for index in old.sorted(by: >) {
+            transfer(messageAt: index, from: "Junk", to: "Trash")
+        }
+    }
+
+    /// The Dock badge shows the In unread count (Getting Attention).
+    func updateDockBadge() {
+        let unread = mailbox(named: "In")?.summaries
+            .filter { $0.state == .unread }.count ?? 0
+        NewMailAttention.updateDockBadge(unread: unread,
+                                         enabled: settings.dockBadgeUnread)
+    }
+
+    // MARK: automatic checking (PREF_AUTO_CHECK / PREF_INTERVAL)
+
+    private var autoCheckTask: Task<Void, Never>?
+    private var autoCheckConfig: (enabled: Bool, minutes: Int) = (false, 0)
+
+    /// (Re)arms the auto-check loop when its settings changed.
+    func refreshAutoCheck() {
+        let config = (settings.autoCheck, settings.checkIntervalMinutes)
+        guard config != autoCheckConfig else { return }
+        autoCheckConfig = config
+        autoCheckTask?.cancel()
+        autoCheckTask = nil
+        guard settings.autoCheck, settings.checkIntervalMinutes > 0 else { return }
+        let minutes = settings.checkIntervalMinutes
+        autoCheckTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(minutes) * 60_000_000_000)
+                guard !Task.isCancelled, let self else { break }
+                if !self.isCheckingMail {
+                    self.checkMail(auto: true)
                 }
             }
         }
@@ -501,10 +593,11 @@ final class AppModel: ObservableObject {
     }
 
     /// Send every QUEUED message in Out (the classic Send Queued Messages).
-    func sendQueuedMessages() {
+    /// quiet suppresses the nothing-to-do chatter for send-on-check.
+    func sendQueuedMessages(quiet: Bool = false) {
         let account = settings.dominant
         guard !account.smtpHost.isEmpty else {
-            statusText = "Set up an SMTP server in Settings first."
+            if !quiet { statusText = "Set up an SMTP server in Settings first." }
             return
         }
         guard let out = mailbox(named: "Out") else { return }
@@ -526,7 +619,7 @@ final class AppModel: ObservableObject {
             queued.append((i, raw, rcpts.joined(separator: ", "), sender))
         }
         guard !queued.isEmpty else {
-            statusText = "No queued messages."
+            if !quiet { statusText = "No queued messages." }
             return
         }
 
@@ -575,54 +668,146 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Queue a composed message into Out.
+    /// Queue a composed message into Out, running outgoing filters over
+    /// the queued copy (the classic on-queue filter pass).
     func queue(message: String) {
-        guard let out = mailbox(named: "Out") else { return }
-        if (try? out.append(message: message, state: .queued)) != nil {
-            try? out.save()
-            refreshMailbox(named: "Out")
-            statusText = "Message queued."
+        guard let out = mailbox(named: "Out"),
+              let index = try? out.append(message: message, state: .queued)
+        else { return }
+        if let filters = try? FilterSet(path: filtersURL.path) {
+            let book = try? AddressBook(path: nicknamesURL.path)
+            let fired = filters.run(on: message, event: .outgoing,
+                                    addressBook: book)
+            var transfers: [PendingTransfer] = []
+            applyActions(fired, mailbox: out, index: index,
+                         transfers: &transfers)
+            applyTransfers(transfers, from: "Out")
         }
+        try? out.save()
+        refreshMailbox(named: "Out")
+        statusText = "Message queued."
     }
 
-    /// Run incoming filters over a message (used after Check Mail and from
-    /// the Special menu's Filter Messages).
-    func runFilters(on mailboxName: String) {
+    // MARK: filters
+
+    private struct PendingTransfer {
+        let index: Int
+        let target: String
+        let copy: Bool
+    }
+
+    /// Run filters over a mailbox.  Check Mail passes .incoming; the
+    /// Filter Messages menu passes .manual (mark filters Manual to use ⌘J,
+    /// exactly like the original).
+    func runFilters(on mailboxName: String, event: FilterEvent = .manual,
+                    quiet: Bool = false) {
         guard let filters = try? FilterSet(path: filtersURL.path),
               let mb = mailbox(named: mailboxName)
         else { return }
         let book = try? AddressBook(path: nicknamesURL.path)
 
-        var transfers: [(index: Int, target: String)] = []
+        var transfers: [PendingTransfer] = []
         for i in 0..<mb.count {
             guard let raw = try? mb.rawMessage(at: i) else { continue }
-            let fired = filters.run(on: raw, event: .incoming, addressBook: book)
-            for action in fired {
-                switch action.keyword {
-                case "transfer":
-                    transfers.append((i, action.value))
-                case "junk":
-                    mb.setState(.read, at: i)
-                case "label":
-                    mb.setLabel(Int(action.value) ?? 0, at: i)
-                case "status":
-                    break // states are engine-scanned; leave as-is
-                default:
-                    break
-                }
-            }
+            let fired = filters.run(on: raw, event: event, addressBook: book)
+            applyActions(fired, mailbox: mb, index: i, transfers: &transfers)
         }
-        // Apply transfers last, highest index first.
-        for t in transfers.sorted(by: { $0.index > $1.index }) {
-            transfer(messageAt: t.index, from: mailboxName, to: t.target)
-        }
+        applyTransfers(transfers, from: mailboxName)
         try? mb.save()
         mailboxGeneration += 1
-        statusText = "Filters run on \(mailboxName)."
+        if !quiet {
+            statusText = "Filters run on \(mailboxName)."
+        }
+    }
+
+    /// Executes one message's fired actions ("stop" is already handled by
+    /// the engine's ordering; transfers/copies are deferred so indices
+    /// stay valid).  Unsupported classic actions (speak, open, print,
+    /// forward, redirect, reply, personality) are silently skipped.
+    private func applyActions(_ fired: [FiredAction], mailbox mb: Mailbox,
+                              index: Int,
+                              transfers: inout [PendingTransfer]) {
+        for action in fired {
+            switch action.keyword {
+            case "transfer":
+                transfers.append(PendingTransfer(index: index,
+                                                 target: action.value,
+                                                 copy: false))
+            case "copy":
+                transfers.append(PendingTransfer(index: index,
+                                                 target: action.value,
+                                                 copy: true))
+            case "junk":
+                mb.setSpamScore(Int(action.value) ?? settings.junkXferScore,
+                                at: index)
+            case "label":
+                mb.setLabel(Int(action.value) ?? 0, at: index)
+            case "status":
+                if let v = UInt8(action.value),
+                   let state = MessageState(rawValue: v) {
+                    mb.setState(state, at: index)
+                }
+            case "priority":
+                applyPriorityAction(action.value, mailbox: mb, index: index)
+            case "subject":
+                if !action.value.isEmpty {
+                    mb.setSubject(action.value, at: index)
+                }
+            case "sound":
+                NewMailAttention.playSound(named: action.value)
+            case "notifyUser":
+                statusText = "Filter \"\(action.filterName)\" matched."
+            default:
+                break
+            }
+        }
+    }
+
+    /// Priority action values: "1"-"5" set the display priority; the
+    /// legacy Raise/Lower verbs are canonicalized to "7"/"8" at load.
+    private func applyPriorityAction(_ value: String, mailbox mb: Mailbox,
+                                     index: Int) {
+        guard let sum = mb.summary(at: index) else { return }
+        switch value {
+        case "7":
+            mb.setPriority(display: max(1, sum.priorityDisplay - 1), at: index)
+        case "8":
+            mb.setPriority(display: min(5, sum.priorityDisplay + 1), at: index)
+        default:
+            if let v = Int(value), (1...5).contains(v) {
+                mb.setPriority(display: v, at: index)
+            }
+        }
+    }
+
+    private func applyTransfers(_ transfers: [PendingTransfer],
+                                from mailboxName: String) {
+        for t in transfers.sorted(by: { $0.index > $1.index }) {
+            if t.copy {
+                copyMessage(at: t.index, from: mailboxName, to: t.target)
+            } else {
+                transfer(messageAt: t.index, from: mailboxName, to: t.target)
+            }
+        }
+    }
+
+    /// The Copy To filter action: append without removing the original.
+    func copyMessage(at index: Int, from source: String, to target: String) {
+        guard source != target,
+              let src = mailbox(named: source),
+              let dst = mailbox(named: target),
+              let raw = try? src.rawMessage(at: index),
+              let summary = src.summary(at: index),
+              (try? dst.append(message: raw, state: summary.state)) != nil
+        else { return }
+        try? dst.save()
+        mailboxGeneration += 1
     }
 
     func saveSettings() {
         settings.save(to: settingsURL)
+        refreshAutoCheck()
+        updateDockBadge()
     }
 }
 
