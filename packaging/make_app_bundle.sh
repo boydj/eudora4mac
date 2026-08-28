@@ -4,7 +4,11 @@
 # Usage: packaging/make_app_bundle.sh [products-dir] [out-dir] [version]
 #   products-dir  SwiftPM build products (default .build/release)
 #   out-dir       where Eudora.app and the zip land (default dist)
-#   version       CFBundleShortVersionString (default 0.0.0-dev)
+#   version       release version, e.g. "6.2.4-macos.1" (default 0.0.0-dev).
+#                 The full string names the zip; the Info.plist gets only its
+#                 leading numeric MAJOR[.MINOR[.PATCH]] prefix, because
+#                 CFBundleShortVersionString / CFBundleVersion must be a
+#                 period-separated list of at most three integers.
 #
 # Run from the repository root, after `swift build -c release`.
 #
@@ -31,6 +35,12 @@ PRODUCTS_DIR="${1:-.build/release}"
 OUT_DIR="${2:-dist}"
 VERSION="${3:-0.0.0-dev}"
 
+# Info.plist version keys accept only up to three integers, so strip any
+# pre-release suffix (e.g. "6.2.4-macos.1" -> "6.2.4"); the full VERSION
+# still names the zip and the GitHub Release.
+PLIST_VERSION="$(printf '%s' "$VERSION" | sed -E 's/^([0-9]+(\.[0-9]+){0,2}).*/\1/')"
+[[ -z "$PLIST_VERSION" ]] && PLIST_VERSION="0.0.0"
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$OUT_DIR/Eudora.app"
 RESOURCE_BUNDLE="EudoraCore_EudoraApp.bundle"
@@ -55,7 +65,7 @@ fi
 cp "$REPO_ROOT/swift/EudoraApp/Resources/Eudora.icns" \
    "$APP/Contents/Resources/Eudora.icns"
 
-sed "s/@VERSION@/$VERSION/g" "$REPO_ROOT/packaging/Info.plist.in" \
+sed "s/@VERSION@/$PLIST_VERSION/g" "$REPO_ROOT/packaging/Info.plist.in" \
     > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
