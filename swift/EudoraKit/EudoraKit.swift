@@ -212,7 +212,7 @@ public enum MessageLabel {
 // MARK: - Messages
 
 public final class ParsedMessage {
-    private let handle: OpaquePointer
+    fileprivate let handle: OpaquePointer
 
     public init(raw: String) throws {
         let h = raw.withCString { cstr in
@@ -238,6 +238,68 @@ public final class ParsedMessage {
     public var contentSubtype: String { String(cString: eudora_message_content_subtype(handle)) }
     public var boundary: String { String(cString: eudora_message_boundary(handle)) }
     public var attachmentFilename: String { String(cString: eudora_message_filename(handle)) }
+}
+
+/// One leaf MIME part of a parsed message.  Holds the message alive.
+public struct MessagePart {
+    private let owner: ParsedMessage
+    public let index: Int
+    public let type: String
+    public let subtype: String
+    public let filename: String
+    public let isAttachment: Bool
+    public let depth: Int
+    /// Encoded body length in bytes (an upper bound on the decoded size).
+    public let size: Int
+
+    fileprivate init?(owner: ParsedMessage, index: Int) {
+        var info = eudora_part_info()
+        guard eudora_message_part_info(owner.handle, Int32(index), &info) == 1
+        else { return nil }
+        self.owner = owner
+        self.index = index
+        self.type = info.type.map { String(cString: $0) } ?? ""
+        self.subtype = info.subtype.map { String(cString: $0) } ?? ""
+        self.filename = info.filename.map { String(cString: $0) } ?? ""
+        self.isAttachment = info.is_attachment != 0
+        self.depth = Int(info.depth)
+        self.size = Int(info.size)
+    }
+
+    /// The part's body with its transfer encoding undone.  Binary-safe:
+    /// the bytes travel by pointer+length, never as a C string.
+    public func decode() -> Data {
+        var len = 0
+        guard let p = eudora_message_part_decode(owner.handle, Int32(index),
+                                                 &len)
+        else { return Data() }
+        defer { eudora_string_free(p) }
+        return Data(bytes: p, count: len)
+    }
+}
+
+extension ParsedMessage {
+    /// Leaf MIME parts in document order; one part for a plain message.
+    public var parts: [MessagePart] {
+        (0..<Int(eudora_message_part_count(handle))).compactMap {
+            MessagePart(owner: self, index: $0)
+        }
+    }
+
+    public var attachments: [MessagePart] { parts.filter(\.isAttachment) }
+
+    /// The most readable body text: for a multipart message, the first
+    /// text/plain (else any text) leaf, decoded; otherwise the decoded
+    /// whole body.
+    public var bestBodyText: String {
+        let all = parts
+        if all.count > 1,
+           let text = all.first(where: { $0.type == "text" && $0.subtype == "plain" })
+               ?? all.first(where: { $0.type == "text" }) {
+            return String(decoding: text.decode(), as: UTF8.self)
+        }
+        return decodedBody
+    }
 }
 
 public func parseAddresses(_ headerValue: String) -> [String] {

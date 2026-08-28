@@ -58,6 +58,7 @@ target_sources(eudora_core PRIVATE
   mailstore/mbox_parser.cpp
   mailstore/compaction.cpp
   mail/mime_codec.cpp
+  mail/mime_walker.cpp
   mail/rfc2047.cpp
   mail/lex822.cpp
   mail/header_parser.cpp

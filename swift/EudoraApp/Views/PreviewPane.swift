@@ -3,6 +3,7 @@
 
 #if os(macOS)
 
+import AppKit
 import EudoraKit
 import SwiftUI
 
@@ -23,6 +24,11 @@ struct PreviewPane: View {
             VStack(alignment: .leading, spacing: 0) {
                 headerStrip(summary: summary, message: message)
                 Divider()
+                let attachments = message.attachments
+                if !attachments.isEmpty {
+                    attachmentStrip(attachments)
+                    Divider()
+                }
                 ScrollView {
                     Text(bodyText(of: message))
                         .font(.system(size: CGFloat(model.settings.displayFontSize))
@@ -67,11 +73,55 @@ struct PreviewPane: View {
     }
 
     private func bodyText(of message: ParsedMessage) -> String {
-        // The mailbox stores CR-terminated lines; normalize for display.
-        var text = message.decodedBody
+        // The readable text part of a multipart message (not the raw
+        // boundary soup); CR-terminated lines normalized for display.
+        var text = message.bestBodyText
         text = text.replacingOccurrences(of: "\r\n", with: "\n")
         text = text.replacingOccurrences(of: "\r", with: "\n")
         return text
+    }
+
+    // MARK: attachments
+
+    private func attachmentStrip(_ parts: [MessagePart]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(parts, id: \.index) { part in
+                    Button {
+                        save(part)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "paperclip")
+                            Text(part.filename.isEmpty
+                                 ? "\(part.type)/\(part.subtype)"
+                                 : part.filename)
+                            Text(ClassicStyle.sizeK(part.size))
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.callout)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.quaternary,
+                                    in: RoundedRectangle(cornerRadius: 5))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Save attachment…")
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+        }
+        .background(.quaternary.opacity(0.2))
+    }
+
+    private func save(_ part: MessagePart) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue =
+            part.filename.isEmpty ? "attachment" : part.filename
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            try? part.decode().write(to: url)
+        }
     }
 }
 

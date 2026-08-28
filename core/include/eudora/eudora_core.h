@@ -138,6 +138,29 @@ int eudora_message_transfer_encoding(const eudora_message *msg);
 char *eudora_decode_body(const char *data, size_t len, int encoding,
                          size_t *out_len);
 
+/* ---- MIME parts -------------------------------------------------------- */
+
+typedef struct {
+    const char *type;      /* lowercased; owned by the message handle */
+    const char *subtype;
+    const char *filename;  /* "" when the part is unnamed */
+    int transfer_encoding; /* same coding as eudora_message_transfer_encoding */
+    int32_t depth;         /* 0 = the whole-message body */
+    int is_attachment;
+    int64_t size;          /* encoded body span, bytes */
+} eudora_part_info;
+
+/* Leaf MIME parts of the message in document order (multipart containers
+ * are walked, not listed).  A plain message has exactly one part. */
+int32_t eudora_message_part_count(const eudora_message *msg);
+int eudora_message_part_info(const eudora_message *msg, int32_t index,
+                             eudora_part_info *out);
+/* The part's body decoded per its transfer encoding: malloc'd, *out_len
+ * bytes plus an uncounted trailing NUL (the data may itself contain NULs).
+ * Free with eudora_string_free. */
+char *eudora_message_part_decode(const eudora_message *msg, int32_t index,
+                                 size_t *out_len);
+
 /* Parse an address list into a NULL-terminated malloc'd array. */
 char **eudora_parse_addresses(const char *header_value);
 void eudora_addresses_free(char **addresses);

@@ -21,6 +21,7 @@
 #include "mail/composer.hpp"
 #include "mail/header_parser.hpp"
 #include "mail/mime_codec.hpp"
+#include "mail/mime_walker.hpp"
 #include "mailstore/compaction.hpp"
 #include "mailstore/mbox_parser.hpp"
 #include "mailstore/toc_io.hpp"
@@ -78,6 +79,7 @@ struct eudora_message {
     HeaderSet headers;
     std::string boundary;
     std::string filename;
+    std::vector<MimePart> parts; // leaf parts; offsets index into raw
     // per-handle stable storage for returned decoded headers is malloc'd
 };
 
@@ -278,6 +280,7 @@ eudora_message *eudora_message_parse(const char *raw, size_t len) {
     msg->body.assign(parts.body);
     msg->boundary = msg->headers.boundary();
     msg->filename = msg->headers.filename();
+    msg->parts = walk_mime(msg->raw);
     return msg.release();
 }
 
@@ -327,6 +330,57 @@ int eudora_message_transfer_encoding(const eudora_message *msg) {
     case TransferEncoding::Other: return 3;
     default: return 0;
     }
+}
+
+/* ---- MIME parts -------------------------------------------------------- */
+
+extern "C++" {
+namespace {
+int encoding_code(TransferEncoding e) {
+    switch (e) {
+    case TransferEncoding::QuotedPrintable: return 1;
+    case TransferEncoding::Base64: return 2;
+    case TransferEncoding::Other: return 3;
+    default: return 0;
+    }
+}
+} // namespace
+} // extern "C++"
+
+int32_t eudora_message_part_count(const eudora_message *msg) {
+    return msg ? static_cast<int32_t>(msg->parts.size()) : 0;
+}
+
+int eudora_message_part_info(const eudora_message *msg, int32_t index,
+                             eudora_part_info *out) {
+    if (!msg || !out || index < 0 ||
+        index >= static_cast<int32_t>(msg->parts.size())) {
+        set_error("part index out of range");
+        return 0;
+    }
+    const MimePart &p = msg->parts[static_cast<std::size_t>(index)];
+    out->type = p.type.c_str();
+    out->subtype = p.subtype.c_str();
+    out->filename = p.filename.c_str();
+    out->transfer_encoding = encoding_code(p.encoding);
+    out->depth = p.depth;
+    out->is_attachment = p.is_attachment ? 1 : 0;
+    out->size = static_cast<int64_t>(p.body_length);
+    return 1;
+}
+
+char *eudora_message_part_decode(const eudora_message *msg, int32_t index,
+                                 size_t *out_len) {
+    if (!msg || index < 0 ||
+        index >= static_cast<int32_t>(msg->parts.size())) {
+        set_error("part index out of range");
+        return nullptr;
+    }
+    const std::string decoded =
+        decode_part(msg->raw, msg->parts[static_cast<std::size_t>(index)]);
+    if (out_len)
+        *out_len = decoded.size();
+    return dup_string(decoded);
 }
 
 char *eudora_decode_body(const char *data, size_t len, int encoding,

@@ -466,6 +466,51 @@ TEST_CASE("C API: POP3 UIDL dedup, progress, and cancel") {
 }
 #endif // !_WIN32
 
+TEST_CASE("C API: MIME parts and binary-safe decode") {
+    // Base64 of bytes {'A', 0x00, 'B', 0xFF} = "QQBC/w==".
+    const std::string raw =
+        "From: a@example.com\r"
+        "Content-Type: multipart/mixed; boundary=\"zz\"\r"
+        "\r"
+        "--zz\r"
+        "Content-Type: text/plain\r"
+        "\r"
+        "see attachment\r"
+        "--zz\r"
+        "Content-Type: application/octet-stream\r"
+        "Content-Transfer-Encoding: base64\r"
+        "Content-Disposition: attachment; filename=\"nul.bin\"\r"
+        "\r"
+        "QQBC/w==\r"
+        "--zz--\r";
+    eudora_message *msg = eudora_message_parse(raw.data(), raw.size());
+    CHECK(msg != nullptr);
+    if (!msg)
+        return;
+    CHECK_EQ(eudora_message_part_count(msg), 2);
+
+    eudora_part_info info{};
+    CHECK(eudora_message_part_info(msg, 1, &info));
+    CHECK_EQ(std::string(info.filename), "nul.bin");
+    CHECK_EQ(info.transfer_encoding, 2);
+    CHECK(info.is_attachment);
+
+    size_t len = 0;
+    char *bytes = eudora_message_part_decode(msg, 1, &len);
+    CHECK(bytes != nullptr);
+    if (bytes) {
+        // The decoded data contains a NUL: length, not strlen, is truth.
+        CHECK_EQ(len, static_cast<size_t>(4));
+        CHECK_EQ(bytes[0], 'A');
+        CHECK_EQ(bytes[1], '\0');
+        CHECK_EQ(bytes[2], 'B');
+        CHECK_EQ(static_cast<unsigned char>(bytes[3]), 0xFFu);
+        eudora_string_free(bytes);
+    }
+    CHECK(eudora_message_part_info(msg, 2, &info) == 0); // out of range
+    eudora_message_free(msg);
+}
+
 TEST_CASE("C API: summary setters and find-by-serial") {
     const fs::path box = temp_dir() / "SetterBox";
     write_file(box, kMailbox + kMailbox);
