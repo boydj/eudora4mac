@@ -107,6 +107,13 @@ ImapToken parse_token(Cursor &cur) {
     // atom (or NIL / number)
     while (!cur.at_end() && is_atom_char(cur.peek()))
         tok.text += cur.text[cur.pos++];
+    // A stray non-atom byte (e.g. a bare '{' or '}' from a malicious or
+    // broken server) matches no case above and is not an atom char, so the
+    // loop consumes nothing.  Skip one byte to guarantee forward progress —
+    // otherwise tokenize()/parse_list() would spin forever appending empty
+    // tokens until memory is exhausted.
+    if (tok.text.empty() && !cur.at_end())
+        ++cur.pos;
     if (iequals(tok.text, "NIL"))
         tok.kind = ImapToken::Kind::Nil;
     return tok;
@@ -125,6 +132,11 @@ std::vector<ImapToken> tokenize(std::string_view line,
     return out;
 }
 
+// A malicious server must not be able to make us pre-allocate arbitrary
+// memory from an announced literal size; cap it well above any real
+// message part (matching the spirit of the big-message limit).
+constexpr long kMaxImapLiteral = 128L * 1024 * 1024; // 128 MiB
+
 std::optional<long> literal_size(std::string_view line) {
     // A line ending "{123}" announces a literal.
     line = strip_cr(line);
@@ -139,10 +151,15 @@ std::optional<long> literal_size(std::string_view line) {
     // Ignore a LITERAL+ "+" suffix.
     if (digits.back() == '+')
         digits.remove_suffix(1);
+    if (digits.empty() || digits.size() > 18) // 18 digits fit in a long
+        return std::nullopt;
     for (char c : digits)
         if (!std::isdigit(static_cast<unsigned char>(c)))
             return std::nullopt;
-    return std::atol(std::string(digits).c_str());
+    const long size = std::atol(std::string(digits).c_str());
+    if (size < 0 || size > kMaxImapLiteral)
+        return std::nullopt; // reject: run_command treats this as a bad line
+    return size;
 }
 
 } // namespace

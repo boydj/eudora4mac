@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <map>
 #include <memory>
 #include <string>
@@ -274,15 +276,25 @@ eudora_message *eudora_message_parse(const char *raw, size_t len) {
         set_error("raw message is null");
         return nullptr;
     }
-    auto msg = std::make_unique<eudora_message>();
-    msg->raw.assign(raw, len);
-    const auto parts = split_message(msg->raw);
-    msg->headers = HeaderSet::parse(parts.header_block);
-    msg->body.assign(parts.body);
-    msg->boundary = msg->headers.boundary();
-    msg->filename = msg->headers.filename();
-    msg->parts = walk_mime(msg->raw);
-    return msg.release();
+    // Parsing untrusted message text can throw (bad_alloc on a hostile
+    // input); never let it cross the C boundary as std::terminate.
+    try {
+        auto msg = std::make_unique<eudora_message>();
+        msg->raw.assign(raw, len);
+        const auto parts = split_message(msg->raw);
+        msg->headers = HeaderSet::parse(parts.header_block);
+        msg->body.assign(parts.body);
+        msg->boundary = msg->headers.boundary();
+        msg->filename = msg->headers.filename();
+        msg->parts = walk_mime(msg->raw);
+        return msg.release();
+    } catch (const std::exception &e) {
+        set_error(std::string("parse failed: ") + e.what());
+        return nullptr;
+    } catch (...) {
+        set_error("parse failed");
+        return nullptr;
+    }
 }
 
 void eudora_message_free(eudora_message *msg) { delete msg; }
@@ -377,11 +389,19 @@ char *eudora_message_part_decode(const eudora_message *msg, int32_t index,
         set_error("part index out of range");
         return nullptr;
     }
-    const std::string decoded =
-        decode_part(msg->raw, msg->parts[static_cast<std::size_t>(index)]);
-    if (out_len)
-        *out_len = decoded.size();
-    return dup_string(decoded);
+    try {
+        const std::string decoded =
+            decode_part(msg->raw, msg->parts[static_cast<std::size_t>(index)]);
+        if (out_len)
+            *out_len = decoded.size();
+        return dup_string(decoded);
+    } catch (const std::exception &e) {
+        set_error(std::string("decode failed: ") + e.what());
+        return nullptr;
+    } catch (...) {
+        set_error("decode failed");
+        return nullptr;
+    }
 }
 
 char *eudora_decode_body(const char *data, size_t len, int encoding,
@@ -595,6 +615,9 @@ int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
         set_error("missing argument");
         return -1;
     }
+    // Untrusted server data drives allocations below; keep any exception
+    // from crossing the C boundary (see the catch at the end).
+    try {
     const eudora_pop3_options opts =
         options ? *options : eudora_pop3_options{0, 0, 0};
     const int delete_from_server = opts.delete_from_server;
@@ -791,6 +814,13 @@ int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
         return fetched;
     }
     return ok ? fetched : -1;
+    } catch (const std::exception &e) {
+        set_error(std::string("POP3 fetch failed: ") + e.what());
+        return -1;
+    } catch (...) {
+        set_error("POP3 fetch failed");
+        return -1;
+    }
 }
 
 int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
@@ -821,6 +851,9 @@ int32_t eudora_imap_fetch_ex(const char *host, uint16_t port, int tls_mode,
         set_error("missing argument");
         return -1;
     }
+    // Untrusted server data drives allocations below; keep any exception
+    // from crossing the C boundary (see the catch at the end).
+    try {
     const std::string remote_box =
         imap_mailbox && *imap_mailbox ? imap_mailbox : "INBOX";
 
@@ -989,6 +1022,13 @@ int32_t eudora_imap_fetch_ex(const char *host, uint16_t port, int tls_mode,
         return fetched;
     }
     return ok ? fetched : -1;
+    } catch (const std::exception &e) {
+        set_error(std::string("IMAP fetch failed: ") + e.what());
+        return -1;
+    } catch (...) {
+        set_error("IMAP fetch failed");
+        return -1;
+    }
 }
 
 /* ---- SMTP -------------------------------------------------------------- */

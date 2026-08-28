@@ -54,7 +54,12 @@ NetError LineReceiver::recv_line(std::string &line, std::size_t max_len) {
 
 NetError LineReceiver::recv_bytes(std::string &out, std::size_t count) {
     out.clear();
-    out.reserve(count);
+    // Do not pre-allocate the full announced size: a caller passes a
+    // server-controlled literal length here, and reserving it up front lets
+    // a bogus (but capped) count commit a large block before any data
+    // arrives.  Grow organically — reserve at most a bounded starter so the
+    // common small case still avoids reallocation churn.
+    out.reserve(std::min<std::size_t>(count, 64 * 1024));
     while (out.size() < count) {
         if (spot_ >= 0) {
             // NOTE: the buffered bytes have already been through the bare-CR

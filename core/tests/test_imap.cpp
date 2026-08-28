@@ -148,4 +148,54 @@ TEST_CASE("IMAP NO/BAD handling and quoting") {
     CHECK(imap.last_response().find("NO") == 0);
 }
 
+TEST_CASE("IMAP tokenizer does not hang on a stray brace") {
+    // A malicious/broken server sends an untagged line containing a bare
+    // '{' that is not a trailing {n} literal marker.  Before the
+    // forward-progress fix this spun forever in the tokenizer; the test
+    // completing at all proves it terminates.
+    ScriptedTransport t({
+        {"", "* OK ready\r\n"},
+        {"A0001 CAPABILITY\r\n", "* CAPABILITY IMAP4rev1\r\nA0001 OK\r\n"},
+        {"A0002 LOGIN \"u\" \"p\"\r\n", "A0002 OK\r\n"},
+        {"A0003 SELECT \"INBOX\"\r\n",
+         "* 1 EXISTS\r\n"
+         "* OK [some { junk ] noise\r\n"     // bare '{' mid-line
+         "* OK (UIDVALIDITY 1) ok\r\n"
+         "A0003 OK [READ-WRITE] done\r\n"},
+    });
+    ImapSession imap(t);
+    CHECK(imap.connect("imap.example.com", 143));
+    CHECK(imap.login("u", "p"));
+    ImapMailboxInfo info;
+    CHECK(imap.select("INBOX", info)); // returns rather than hanging
+    CHECK_EQ(info.exists, 1);
+    CHECK_EQ(info.uid_validity, 1u);
+}
+
+TEST_CASE("IMAP oversized literal is rejected, not pre-allocated") {
+    // A 4 GB literal announcement must not drive an allocation; the client
+    // treats the line as unparseable and the command still completes.
+    ScriptedTransport t({
+        {"", "* OK ready\r\n"},
+        {"A0001 CAPABILITY\r\n", "* CAPABILITY IMAP4rev1\r\nA0001 OK\r\n"},
+        {"A0002 LOGIN \"u\" \"p\"\r\n", "A0002 OK\r\n"},
+        {"A0003 SELECT \"INBOX\"\r\n",
+         "* 1 EXISTS\r\n"
+         "* OK (UIDVALIDITY 1) ok\r\n"
+         "A0003 OK [READ-WRITE] done\r\n"},
+        {"A0004 UID FETCH 1 (UID FLAGS BODY.PEEK[])\r\n",
+         "* 1 FETCH (UID 1 FLAGS () BODY[] {4000000000}\r\n"
+         "A0004 OK done\r\n"},
+    });
+    ImapSession imap(t);
+    CHECK(imap.connect("imap.example.com", 143));
+    CHECK(imap.login("u", "p"));
+    ImapMailboxInfo info;
+    CHECK(imap.select("INBOX", info));
+    // The bogus literal makes the fetch yield no usable body, but the call
+    // returns without a multi-GB allocation or a crash.
+    const auto result = imap.uid_fetch("1", "(UID FLAGS BODY.PEEK[])");
+    CHECK(result.has_value());
+}
+
 EUTEST_MAIN

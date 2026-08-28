@@ -96,6 +96,10 @@ NetError TlsTransport::start_tls(const std::string &host, bool verify) {
         return last_error_ = NetError::TlsError;
     }
     SSL_CTX_set_default_verify_paths(ctx_);
+    // Never negotiate below TLS 1.2, matching the Apple decorator
+    // (apple_tls_transport.cpp's SSLSetProtocolVersionMin(kTLSProtocol12));
+    // otherwise the linked library's default could still permit 1.0/1.1.
+    SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
     SSL_CTX_set_verify(ctx_, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, nullptr);
 
     ssl_ = SSL_new(ctx_);
