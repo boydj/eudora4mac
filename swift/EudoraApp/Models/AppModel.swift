@@ -731,8 +731,10 @@ final class AppModel: ObservableObject {
 
         var transfers: [PendingTransfer] = []
         for i in 0..<mb.count {
-            guard let raw = try? mb.rawMessage(at: i) else { continue }
-            let fired = filters.run(on: raw, event: event, addressBook: book)
+            // Mailbox-aware run so junk-score / status / priority / date
+            // TERMS can match, not just header/body string terms.
+            let fired = filters.run(onMailbox: mb, index: i, event: event,
+                                    addressBook: book)
             applyActions(fired, mailbox: mb, index: i, transfers: &transfers)
         }
         applyTransfers(transfers, from: mailboxName)

@@ -1613,6 +1613,50 @@ int eudora_filters_save(const eudora_filters *f, const char *path) {
     return write_filters(f->filters, path) ? 1 : 0;
 }
 
+extern "C++" {
+namespace {
+
+eudora_fired_action *run_filters_c(const std::vector<Filter> &filters,
+                                   int event, std::string_view raw,
+                                   const MessageSummary *summary,
+                                   const eudora_addressbook *book,
+                                   int32_t *out_count) {
+    *out_count = 0;
+    FilterEvent ev = FilterEvent::Incoming;
+    if (event == EUDORA_FILTER_OUTGOING)
+        ev = FilterEvent::Outgoing;
+    else if (event == EUDORA_FILTER_MANUAL)
+        ev = FilterEvent::Manual;
+
+    FilterContext ctx;
+    ctx.raw_message = raw;
+    ctx.summary = summary; // enables score/status/priority/date terms
+    if (book) {
+        ctx.address_in_book = [book](std::string_view addr, std::string_view) {
+            return book->book.contains_address(addr);
+        };
+    }
+    const auto fired = run_filters(filters, ev, ctx);
+    if (fired.empty())
+        return nullptr;
+
+    auto *arr = static_cast<eudora_fired_action *>(
+        std::calloc(fired.size(), sizeof(eudora_fired_action)));
+    if (!arr)
+        return nullptr;
+    for (std::size_t i = 0; i < fired.size(); ++i) {
+        arr[i].filter_name = dup_string(fired[i].filter->name);
+        arr[i].keyword =
+            dup_string(filter_keyword_string(fired[i].action.keyword));
+        arr[i].value = dup_string(fired[i].action.value);
+    }
+    *out_count = static_cast<int32_t>(fired.size());
+    return arr;
+}
+
+} // namespace
+} // extern "C++"
+
 eudora_fired_action *eudora_filters_run(const eudora_filters *f, int event,
                                         const char *raw_message, size_t len,
                                         int32_t *out_count) {
@@ -1625,37 +1669,25 @@ eudora_fired_action *eudora_filters_run_with_book(
     const eudora_addressbook *book, int32_t *out_count) {
     if (!f || !raw_message || !out_count)
         return nullptr;
+    return run_filters_c(f->filters, event,
+                         std::string_view(raw_message, len), nullptr, book,
+                         out_count);
+}
+
+eudora_fired_action *eudora_filters_run_in_mailbox(
+    const eudora_filters *f, int event, const eudora_mailbox *mb, int32_t index,
+    const eudora_addressbook *book, int32_t *out_count) {
+    if (!f || !mb || !out_count || index < 0 || index >= mb->toc.count())
+        return nullptr;
     *out_count = 0;
-
-    FilterEvent ev = FilterEvent::Incoming;
-    if (event == EUDORA_FILTER_OUTGOING)
-        ev = FilterEvent::Outgoing;
-    else if (event == EUDORA_FILTER_MANUAL)
-        ev = FilterEvent::Manual;
-
-    FilterContext ctx;
-    ctx.raw_message = std::string_view(raw_message, len);
-    if (book) {
-        // Single-book model: the term's file name is not consulted.
-        ctx.address_in_book = [book](std::string_view addr, std::string_view) {
-            return book->book.contains_address(addr);
-        };
-    }
-    const auto fired = run_filters(f->filters, ev, ctx);
-    if (fired.empty())
-        return nullptr;
-
-    auto *arr = static_cast<eudora_fired_action *>(
-        std::calloc(fired.size(), sizeof(eudora_fired_action)));
-    if (!arr)
-        return nullptr;
-    for (std::size_t i = 0; i < fired.size(); ++i) {
-        arr[i].filter_name = dup_string(fired[i].filter->name);
-        arr[i].keyword = dup_string(filter_keyword_string(fired[i].action.keyword));
-        arr[i].value = dup_string(fired[i].action.value);
-    }
-    *out_count = static_cast<int32_t>(fired.size());
-    return arr;
+    // The message text AND its summary, so junk-score / status / priority /
+    // date TERMS can match (FilterContext.summary), not just header/body
+    // string terms.
+    const MessageSummary &sum = mb->toc.sums[static_cast<std::size_t>(index)];
+    std::string raw;
+    if (sum.offset >= 0)
+        raw = read_file_range(mb->toc.mailbox_path, sum.offset, sum.length);
+    return run_filters_c(f->filters, event, raw, &sum, book, out_count);
 }
 
 void eudora_fired_actions_free(eudora_fired_action *actions, int32_t count) {

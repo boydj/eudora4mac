@@ -74,7 +74,7 @@ public struct MessageSummary {
 
 /// A classic Eudora mailbox: the mbox file plus its ".toc" sidecar.
 public final class Mailbox {
-    private let handle: OpaquePointer
+    let handle: OpaquePointer
 
     public init(path: String) throws {
         guard let h = eudora_mailbox_open(path) else { throw EudoraError.fromLast() }
@@ -629,6 +629,22 @@ public final class FilterSet {
             eudora_filters_run_with_book(handle, event.rawValue, cstr, strlen(cstr),
                                          addressBook?.handle, &count)
         }
+        return firedActions(fired, count)
+    }
+
+    /// Evaluates the filters against a message in an open mailbox, passing
+    /// its summary so junk-score / status / priority / date TERMS match.
+    public func run(onMailbox mb: Mailbox, index: Int, event: FilterEvent,
+                    addressBook: AddressBook? = nil) -> [FiredAction] {
+        var count: Int32 = 0
+        let fired = eudora_filters_run_in_mailbox(
+            handle, event.rawValue, mb.handle, Int32(index),
+            addressBook?.handle, &count)
+        return firedActions(fired, count)
+    }
+
+    private func firedActions(_ fired: UnsafeMutablePointer<eudora_fired_action>?,
+                              _ count: Int32) -> [FiredAction] {
         guard let fired else { return [] }
         defer { eudora_fired_actions_free(fired, count) }
         return (0..<Int(count)).map { i in

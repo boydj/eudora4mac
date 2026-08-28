@@ -380,6 +380,12 @@ eudora_fired_action *eudora_filters_run(const eudora_filters *f, int event,
 eudora_fired_action *eudora_filters_run_with_book(
     const eudora_filters *f, int event, const char *raw_message, size_t len,
     const eudora_addressbook *book, int32_t *out_count);
+/* Evaluate the message at `index` in an open mailbox, passing its TOC
+ * summary so score/status/priority/date TERMS can match (not just header
+ * and body string terms).  book may be NULL. */
+eudora_fired_action *eudora_filters_run_in_mailbox(
+    const eudora_filters *f, int event, const eudora_mailbox *mb,
+    int32_t index, const eudora_addressbook *book, int32_t *out_count);
 void eudora_fired_actions_free(eudora_fired_action *actions, int32_t count);
 
 #ifdef __cplusplus

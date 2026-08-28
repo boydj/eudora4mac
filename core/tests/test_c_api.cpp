@@ -163,6 +163,48 @@ TEST_CASE("C API: filters") {
     }
 }
 
+TEST_CASE("C API: junk-score filter TERM matches only with a summary") {
+    const std::string filterText =
+        "rule Score it\r"
+        "incoming\r"
+        "header <<junk score>>\r"
+        "verb greater\r"
+        "value 50\r"
+        "transfer Junk\r";
+    eudora_filters *f = eudora_filters_parse(filterText.c_str());
+    CHECK(f != nullptr);
+    if (!f)
+        return;
+
+    const fs::path box = temp_dir() / "ScoreFilterBox";
+    write_file(box, kMailbox);
+    eudora_mailbox *mb = eudora_mailbox_open(box.string().c_str());
+    CHECK(mb != nullptr);
+    if (mb) {
+        eudora_mailbox_set_spam_score(mb, 0, 90); // above the threshold
+
+        // Without a summary (raw-only run) the score term can't match.
+        int32_t n0 = 0;
+        eudora_fired_action *none = eudora_filters_run(
+            f, EUDORA_FILTER_INCOMING, kMailbox.data(), kMailbox.size(), &n0);
+        CHECK_EQ(n0, 0);
+        eudora_fired_actions_free(none, n0);
+
+        // With the mailbox summary, the junk-score term fires.
+        int32_t n1 = 0;
+        eudora_fired_action *fired = eudora_filters_run_in_mailbox(
+            f, EUDORA_FILTER_INCOMING, mb, 0, nullptr, &n1);
+        CHECK_EQ(n1, 1);
+        if (fired && n1 == 1) {
+            CHECK_EQ(std::string(fired[0].keyword), "transfer");
+            CHECK_EQ(std::string(fired[0].value), "Junk");
+        }
+        eudora_fired_actions_free(fired, n1);
+        eudora_mailbox_close(mb);
+    }
+    eudora_filters_free(f);
+}
+
 #if !defined(_WIN32)
 #include <algorithm>
 #include <mutex>
