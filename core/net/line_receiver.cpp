@@ -39,16 +39,45 @@ NetError LineReceiver::recv_line(std::string &line, std::size_t max_len) {
             // TREAT_BODY_CR_AS_CRLF (ph.c:3105-3121): bare CR from broken
             // servers becomes a line break.  Sloppy at buffer boundaries,
             // exactly like the original ("ASK ME IF I CARE!!!!").
-            for (long i = 0; i < count - 1; ++i)
-                if (buffer_[static_cast<std::size_t>(i)] == '\r' &&
-                    buffer_[static_cast<std::size_t>(i + 1)] != '\n')
-                    buffer_[static_cast<std::size_t>(i)] = '\n';
+            if (bare_cr_is_newline_)
+                for (long i = 0; i < count - 1; ++i)
+                    if (buffer_[static_cast<std::size_t>(i)] == '\r' &&
+                        buffer_[static_cast<std::size_t>(i + 1)] != '\n')
+                        buffer_[static_cast<std::size_t>(i)] = '\n';
             filled_ = count;
             spot_ = 0;
         }
     }
 
     return line.empty() ? err : NetError::None;
+}
+
+NetError LineReceiver::recv_bytes(std::string &out, std::size_t count) {
+    out.clear();
+    out.reserve(count);
+    while (out.size() < count) {
+        if (spot_ >= 0) {
+            // NOTE: the buffered bytes have already been through the bare-CR
+            // rewrite; raw literal reads should normally start with an empty
+            // buffer (the {n} marker ends a line), so this only matters for
+            // pathological pipelining.
+            while (spot_ < filled_ && out.size() < count)
+                out += buffer_[static_cast<std::size_t>(spot_++)];
+            if (spot_ >= filled_)
+                spot_ = -1;
+        } else {
+            if (transport_.cancelled())
+                return NetError::Cancelled;
+            const long n = transport_.recv(buffer_.data(),
+                                           static_cast<long>(std::min(
+                                               buffer_.size(),
+                                               count - out.size())));
+            if (n <= 0)
+                return n == 0 ? NetError::Closed : transport_.last_error();
+            out.append(buffer_.data(), static_cast<std::size_t>(n));
+        }
+    }
+    return NetError::None;
 }
 
 } // namespace eudora

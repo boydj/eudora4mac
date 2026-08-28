@@ -69,6 +69,7 @@ target_sources(eudora_core PRIVATE
   protocols/sasl.cpp
   protocols/pop3.cpp
   protocols/smtp.cpp
+  protocols/imap.cpp
   filters/regexp.cpp
   filters/filter_file.cpp
   filters/match_engine.cpp

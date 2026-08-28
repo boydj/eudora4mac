@@ -18,7 +18,10 @@
 #include "mailstore/toc_format.hpp"
 #include "mailstore/toc_io.hpp"
 
+#include "addressbook/nicknames.hpp"
+
 #include "mail/address_parser.hpp"
+#include "mail/composer.hpp"
 #include "mail/header_parser.hpp"
 #include "mail/lex822.hpp"
 #include "mail/mime_codec.hpp"
@@ -31,6 +34,7 @@
 #include "net/tls_transport.hpp"
 #endif
 
+#include "protocols/imap.hpp"
 #include "protocols/pop3.hpp"
 #include "protocols/sasl.hpp"
 #include "protocols/smtp.hpp"
