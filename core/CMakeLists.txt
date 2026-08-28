@@ -51,6 +51,7 @@ target_sources(eudora_core PRIVATE
   compat/macroman.cpp
   compat/macdate.cpp
   compat/hashes.cpp
+  compat/charset.cpp
   mailstore/table_of_contents.cpp
   mailstore/toc_format.cpp
   mailstore/toc_io.cpp
@@ -59,6 +60,7 @@ target_sources(eudora_core PRIVATE
   mailstore/compaction.cpp
   mail/mime_codec.cpp
   mail/mime_walker.cpp
+  mail/attachment_decode.cpp
   mail/rfc2047.cpp
   mail/lex822.cpp
   mail/header_parser.cpp

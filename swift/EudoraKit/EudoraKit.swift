@@ -276,6 +276,14 @@ public struct MessagePart {
         defer { eudora_string_free(p) }
         return Data(bytes: p, count: len)
     }
+
+    /// A text part decoded and converted from its charset to UTF-8.
+    public func text() -> String {
+        guard let p = eudora_message_part_text(owner.handle, Int32(index))
+        else { return "" }
+        defer { eudora_string_free(p) }
+        return String(cString: p)
+    }
 }
 
 extension ParsedMessage {
@@ -294,9 +302,9 @@ extension ParsedMessage {
     public var bestBodyText: String {
         let all = parts
         if all.count > 1,
-           let text = all.first(where: { $0.type == "text" && $0.subtype == "plain" })
+           let part = all.first(where: { $0.type == "text" && $0.subtype == "plain" })
                ?? all.first(where: { $0.type == "text" }) {
-            return String(decoding: text.decode(), as: UTF8.self)
+            return part.text() // charset-converted to UTF-8
         }
         return decodedBody
     }

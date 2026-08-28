@@ -3,6 +3,7 @@ set(EUDORA_TEST_SOURCES
   test_mailstore.cpp
   test_mail.cpp
   test_mime_walker.cpp
+  test_attachments.cpp
   test_protocols.cpp
   test_filters.cpp
   test_c_api.cpp

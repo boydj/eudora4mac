@@ -161,6 +161,11 @@ int eudora_message_part_info(const eudora_message *msg, int32_t index,
 char *eudora_message_part_decode(const eudora_message *msg, int32_t index,
                                  size_t *out_len);
 
+/* A text part decoded AND converted from its charset to UTF-8 (for display);
+ * non-text parts return their raw decoded bytes.  malloc'd; free with
+ * eudora_string_free. */
+char *eudora_message_part_text(const eudora_message *msg, int32_t index);
+
 /* Parse an address list into a NULL-terminated malloc'd array. */
 char **eudora_parse_addresses(const char *header_value);
 void eudora_addresses_free(char **addresses);

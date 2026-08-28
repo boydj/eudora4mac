@@ -1,5 +1,7 @@
 #include "mail/mime_walker.hpp"
 
+#include "compat/charset.hpp"
+#include "mail/attachment_decode.hpp"
 #include "mail/mime_codec.hpp"
 
 namespace eudora {
@@ -111,6 +113,8 @@ void walk_block(std::string_view raw, std::size_t off, std::size_t len,
                        ? "plain"
                        : hs.content_subtype();
     part.filename = hs.filename();
+    if (auto cs = hs.content_attribute("charset"))
+        part.charset = std::string(*cs);
     part.encoding = hs.transfer_encoding();
     part.body_offset = body_off;
     part.body_length = body_len;
@@ -140,13 +144,37 @@ std::string decode_part(std::string_view raw_message, const MimePart &part) {
     switch (part.encoding) {
     case TransferEncoding::Base64:
         base64_decode(body, out, part.type == "text");
-        return out;
+        break;
     case TransferEncoding::QuotedPrintable:
         qp_decode(body, out);
-        return out;
+        break;
     default:
-        return std::string(body);
+        out.assign(body);
+        break;
     }
+    // A part wrapping a classic Mac attachment container (AppleSingle/Double
+    // via application/applefile, or BinHex via application/mac-binhex40)
+    // yields the data fork so the saved file is the real content, not the
+    // container.
+    if (part.type == "application" &&
+        (part.subtype == "applefile" || part.subtype == "mac-binhex40" ||
+         part.subtype == "binhex40")) {
+        const auto classic = decode_classic_attachment(out);
+        if (classic.ok)
+            return classic.data;
+    }
+    return out;
+}
+
+std::string decode_text_part(std::string_view raw_message,
+                             const MimePart &part) {
+    std::string bytes = decode_part(raw_message, part);
+    if (part.type != "text" || part.charset.empty())
+        return bytes;
+    std::string utf8;
+    if (charset_to_utf8(part.charset, bytes, utf8))
+        return utf8;
+    return bytes; // unknown charset: keep the bytes (legacy punt)
 }
 
 } // namespace eudora

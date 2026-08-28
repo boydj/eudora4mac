@@ -435,6 +435,21 @@ char *eudora_message_part_decode(const eudora_message *msg, int32_t index,
     }
 }
 
+char *eudora_message_part_text(const eudora_message *msg, int32_t index) {
+    if (!msg || index < 0 ||
+        index >= static_cast<int32_t>(msg->parts.size())) {
+        set_error("part index out of range");
+        return nullptr;
+    }
+    try {
+        return dup_string(decode_text_part(
+            msg->raw, msg->parts[static_cast<std::size_t>(index)]));
+    } catch (...) {
+        set_error("decode failed");
+        return nullptr;
+    }
+}
+
 char *eudora_decode_body(const char *data, size_t len, int encoding,
                          size_t *out_len) {
     if (!data || !out_len)
