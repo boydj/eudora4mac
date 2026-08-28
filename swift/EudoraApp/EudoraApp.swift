@@ -18,6 +18,14 @@ final class EudoraAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+
+        // The classic Eudora icon, carried over from the legacy bundle.
+        // (A bundled Xcode build would set this via CFBundleIconFile; doing
+        // it at runtime also covers `swift run`.)
+        if let url = Bundle.module.url(forResource: "Eudora", withExtension: "icns"),
+           let icon = NSImage(contentsOf: url) {
+            NSApp.applicationIconImage = icon
+        }
     }
 }
 

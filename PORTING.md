@@ -42,7 +42,9 @@ swift run EudoraApp          # development run
 ```
 
 or open the package in Xcode and run the `EudoraApp` scheme (make an app
-target from it for a bundled release build).
+target from it for a bundled release build; set `CFBundleIconFile` to the
+classic `Eudora.icns`, which the app also carries as a package resource
+and applies at runtime — the Dock shows the original icon either way).
 
 What it recreates, and from where:
 

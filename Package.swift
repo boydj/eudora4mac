@@ -59,7 +59,12 @@ let package = Package(
         .executableTarget(
             name: "EudoraApp",
             dependencies: ["EudoraKit"],
-            path: "swift/EudoraApp"
+            path: "swift/EudoraApp",
+            resources: [
+                // The classic icon, from the legacy app bundle
+                // (EudoraDotApp/Contents/Resources/Eudora.icns).
+                .copy("Resources/Eudora.icns")
+            ]
         ),
     ],
     cxxLanguageStandard: .cxx20
