@@ -31,8 +31,15 @@ ctest --test-dir build        # 6 suites, all platform-independent
 
 ## Attaching a SwiftUI frontend
 
-`core/include/eudora/eudora_core.h` is a flat `extern "C"` interface
-designed for a Swift bridging header / module map:
+The repository root carries a **Swift package** (`Package.swift`): add this
+repo as a package dependency in Xcode and `import EudoraKit` — SwiftPM
+compiles the C++ core itself (TLS disabled without OpenSSL; use the CMake
+build for TLS) and `swift/EudoraKit` provides idiomatic types (`Mailbox`,
+`ParsedMessage`, `AddressBook`, `FilterSet`, `Composer`,
+`pop3Fetch`/`smtpSend`).
+
+Underneath, `core/include/eudora/eudora_core.h` is a flat `extern "C"`
+interface usable from any language:
 
 - mailboxes: `eudora_mailbox_open` (reads or rebuilds the `.toc`),
   summaries, raw message reads, state changes, delete + compact, save
@@ -45,8 +52,13 @@ designed for a Swift bridging header / module map:
   dot stuffing
 - filters: load/parse/save the classic "Eudora Filters" file and evaluate
   messages, returning fired actions in the engine's execution order
+- address book: the "Eudora Nicknames" format, nickname expansion, and
+  membership queries backing the filters' intersects-file verb
+- composition: an RFC 822 builder (RFC 2047 headers, QP bodies,
+  multipart/mixed base64 attachments) feeding `eudora_smtp_send`
 
-C++ consumers use `#include <eudora/core.hpp>`.
+C++ consumers use `#include <eudora/core.hpp>`; the IMAP engine
+(`protocols/imap.hpp`) is currently C++-only.
 
 ## What was ported (and from where)
 
@@ -78,6 +90,9 @@ C++ consumers use `#include <eudora/core.hpp>`.
 | `filters/filter_file` | `filtmng.c` + `FiltDefs` string tables | text format round-trips; `copyInstead` and `raise`/`lower` migrations preserved |
 | `filters/match_engine` | `filtrun.c` match cascade | all 15 verbs, LWSP-insensitive matching, junk meta-term, `FAPass` execution ordering, stop actions |
 | `filters/regexp` | `regexp.c` (Spencer V8 adaptation) | POSIX extended regex (same Spencer lineage) behind the `SearchRegExpPtr` interface |
+| `addressbook/nicknames` | `nickmng.c`/`nickexp.c` | "Eudora Nicknames" alias/note format, quoted names, continuations, recursive expansion with cycle protection |
+| `mail/composer` | `sendmail.c` MIME-generation half | RFC 822 builder: 2047-encoded headers, dated/Message-Id'd, QP or 7bit bodies, multipart/mixed base64 attachments; BinHex/AppleDouble/PICT conversions dropped |
+| `protocols/imap` | `CrispinIMAP/` + `imapnetlib.c` role | direct IMAP4rev1 engine: tagged commands, full literal handling both directions, AUTHENTICATE/LOGIN, SELECT/LIST/FETCH/STORE/SEARCH/APPEND/EXPUNGE, STARTTLS hook |
 
 ## The `.toc` binary format (decoded in `mailstore/toc_format.*`)
 
@@ -100,16 +115,15 @@ unfinished Mach-O target in `Eudora.proj.xml` used PowerPC natural
 alignment and would have produced *different* file offsets; it never
 shipped, so `.toc` files in the wild are the mac68k layout.
 
-## Deliberately not ported (this pass)
+## Deliberately not ported
 
 - **All Carbon UI** — windows, dialogs, menus, PETE editor, toolbar,
   drawers (`boxact.c`, `compact.c`, `filtwin.c`, `mywindow.c`, …). The
-  clean C/Swift API in `core/include/eudora/` is the attachment point for
-  a new SwiftUI frontend.
-- **IMAP** — the UW c-client (`CrispinIMAP/`) is the cleanest large body
-  in the legacy tree and plugs into the same transport seam via its
-  `net_*` glue (~200 lines in `CrispinIMAP/mail.c`); it is the natural
-  next phase, along with `imapdownload.c`'s sync engine.
+  Swift package / C API is the attachment point for a new SwiftUI
+  frontend.
+- **The IMAP sync engine** (`imapdownload.c`'s local-mirror logic): the
+  protocol layer is fully ported (`protocols/imap`); a frontend drives
+  synchronization policy through it.
 - **Dead code**: the abandoned "MIME Store" rewrite
   (`mstore.c`/`mstoc.c`/`msmaildb.c`/`msiddb.c`/`msinfo.c` — never called
   from live code), `ctb.c`/`dial.c` (compiled out since before 6.2.4),
