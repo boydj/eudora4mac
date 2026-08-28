@@ -54,7 +54,12 @@ target_sources(eudora_core PRIVATE
   mailstore/toc_io.cpp
   mailstore/line_reader.cpp
   mailstore/mbox_parser.cpp
-  mailstore/compaction.cpp)
+  mailstore/compaction.cpp
+  mail/mime_codec.cpp
+  mail/rfc2047.cpp
+  mail/lex822.cpp
+  mail/header_parser.cpp
+  mail/address_parser.cpp)
 
 if(EUDORA_ENABLE_TLS)
   find_package(OpenSSL QUIET)
