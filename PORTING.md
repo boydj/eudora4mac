@@ -277,3 +277,41 @@ shipped, so `.toc` files in the wild are the mac68k layout.
 - IMAP accounts fetch INBOX into the local In mailbox (the classic
   minimal-download flavor); folder browsing, flag write-back, and the
   big-message/leave-on-server-days options are POP3-only for now.
+
+### Consciously not reproduced (from the fidelity audit)
+
+These legacy behaviors were reviewed and deliberately left un-ported, with
+the reasoning recorded so the divergence is a choice, not an oversight:
+
+- **Pre-6.2 `CleanseTOC` version-gated upgrades** — the minor-version
+  fixups a real 6.2.4 would run when loading an *older* TOC (minor&lt;7
+  subject rewriting, minor&lt;9 UTF-8 stripping, mood/spam resets). A 6.2.4
+  TOC is already minor 9, so these only fire on ancient imports; they carry
+  real regression risk for no real-world input. The always-run parts
+  (arrival-time fallback, serial renumbering) *are* implemented.
+- **Byte-for-byte preservation of inert TOC fields** — pluginKey,
+  pluginValue, profile[], ezOpenSerialNum and the spares are decoded and
+  re-encoded as zero rather than passed through (see toc_format.hpp); no
+  feature the port implements reads them.
+- **Timezone offset truncation bug** — the classic `'zon#'` handling
+  truncated a few far-east offsets through a `short index`; the port
+  recognizes those zones with their *correct* offsets instead of
+  reproducing the bug.
+- **Address auto-qualification** — legacy appended a default domain
+  (`PREF_AUTOQUAL`) to bare local parts; that pref is unset by default, so
+  the port matches the common case and simply omits the feature.
+- **MacRoman script case-folding** in `same_address` — the port folds case
+  in ASCII, correct for the UTF-8 addresses modern mail uses.
+
+### Hardening beyond the original
+
+- IMAP literal sizes are capped (128 MiB) and the response tokenizer is
+  hardened so a malicious or broken server cannot hang the client or drive
+  an unbounded allocation.
+- Line breaks in a sender address, credentials, or an IMAP mailbox name are
+  rejected to prevent command injection.
+- The OpenSSL TLS path enforces a TLS 1.2 minimum (the Apple SecureTransport
+  path already did).
+- `eudora_mailbox_summary`'s returned `from`/`subject` pointers are stable
+  for the mailbox handle's whole life; message appends `fsync` the data and
+  roll back a partial write.

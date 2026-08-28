@@ -18,10 +18,19 @@
 // The layout below matches the SHIPPING Carbon (CFM) build: big-endian,
 // mac68k 2-byte struct alignment, CodeWarrior MSB-first bitfields, and
 // smallest-fit enums (StateEnum is one byte).  All offsets were derived
-// from Include/mailbox.h under those rules.  Live pointers/Handles that the
-// original serialized as garbage (refN, mesgErrH, cache, messH, win, next,
-// previewPTE, ...) are ignored on read and written as zero, exactly as the
-// original zeroed them on load (toc.c:227-238).
+// from Include/mailbox.h under those rules.
+//
+// Two classes of field are NOT round-tripped:
+//   - Live pointers/Handles the original serialized as garbage (refN,
+//     mesgErrH, cache, messH, win, next, previewPTE, ...) — ignored on read
+//     and written as zero, exactly as the original zeroed them (toc.c:227).
+//   - Inert persisted data no modern feature reads: pluginKey, pluginValue,
+//     profile[], ezOpenSerialNum, oldKValues, sumRandBytes, and the spare
+//     fields.  These occupy real bytes in a legacy image but carry no
+//     behavior we implement, so we decode them as zero and re-encode them
+//     as zero rather than preserving them — a deliberate scope choice, not
+//     a "only live pointers are dropped" guarantee.  A round-trip of a real
+//     Eudora TOC therefore clears them.
 
 #pragma once
 
