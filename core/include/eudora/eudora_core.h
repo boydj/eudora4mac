@@ -142,6 +142,34 @@ int eudora_smtp_send(const char *host, uint16_t port, int tls_mode,
                      const char *from, const char *recipients,
                      const char *message, size_t message_len);
 
+/* ---- address book (Eudora Nicknames) ----------------------------------- */
+
+typedef struct eudora_addressbook eudora_addressbook;
+
+eudora_addressbook *eudora_addressbook_load(const char *path);
+eudora_addressbook *eudora_addressbook_parse(const char *text);
+void eudora_addressbook_free(eudora_addressbook *ab);
+int eudora_addressbook_save(const eudora_addressbook *ab, const char *path);
+
+int32_t eudora_addressbook_count(const eudora_addressbook *ab);
+/* Owned by the book; valid until it is mutated or freed. */
+const char *eudora_addressbook_name(const eudora_addressbook *ab, int32_t i);
+const char *eudora_addressbook_addresses(const eudora_addressbook *ab, int32_t i);
+const char *eudora_addressbook_notes(const eudora_addressbook *ab, int32_t i);
+
+/* Add or replace a nickname. */
+int eudora_addressbook_set(eudora_addressbook *ab, const char *name,
+                           const char *addresses, const char *notes);
+int eudora_addressbook_remove(eudora_addressbook *ab, const char *name);
+
+/* Recursively expand nicknames in an address list; NULL-terminated array,
+ * free with eudora_addresses_free. */
+char **eudora_addressbook_expand(const eudora_addressbook *ab,
+                                 const char *address_list);
+/* Does the address appear in any nickname (filters' intersectsFile)? */
+int eudora_addressbook_contains(const eudora_addressbook *ab,
+                                const char *address);
+
 /* ---- filters ----------------------------------------------------------- */
 
 typedef struct eudora_filters eudora_filters;
@@ -170,6 +198,11 @@ int eudora_filters_save(const eudora_filters *f, const char *path);
 eudora_fired_action *eudora_filters_run(const eudora_filters *f, int event,
                                         const char *raw_message, size_t len,
                                         int32_t *out_count);
+/* Like eudora_filters_run, with an address book backing the
+ * intersects-file verb (may be NULL). */
+eudora_fired_action *eudora_filters_run_with_book(
+    const eudora_filters *f, int event, const char *raw_message, size_t len,
+    const eudora_addressbook *book, int32_t *out_count);
 void eudora_fired_actions_free(eudora_fired_action *actions, int32_t count);
 
 #ifdef __cplusplus

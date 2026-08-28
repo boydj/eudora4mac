@@ -71,6 +71,7 @@ target_sources(eudora_core PRIVATE
   filters/regexp.cpp
   filters/filter_file.cpp
   filters/match_engine.cpp
+  addressbook/nicknames.cpp
   api/eudora_core_c.cpp)
 
 if(EUDORA_ENABLE_TLS)

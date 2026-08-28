@@ -4,7 +4,8 @@ set(EUDORA_TEST_SOURCES
   test_mail.cpp
   test_protocols.cpp
   test_filters.cpp
-  test_c_api.cpp)
+  test_c_api.cpp
+  test_addressbook.cpp)
 
 foreach(src ${EUDORA_TEST_SOURCES})
   get_filename_component(name ${src} NAME_WE)

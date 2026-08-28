@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 
+#include "addressbook/nicknames.hpp"
 #include "compat/macdate.hpp"
 #include "filters/filter_file.hpp"
 #include "filters/match_engine.hpp"
@@ -74,6 +75,10 @@ struct eudora_message {
 
 struct eudora_filters {
     std::vector<Filter> filters;
+};
+
+struct eudora_addressbook {
+    AddressBook book;
 };
 
 extern "C" {
@@ -587,6 +592,101 @@ int eudora_smtp_send(const char *host, uint16_t port, int tls_mode,
     return code;
 }
 
+/* ---- address book ------------------------------------------------------ */
+
+eudora_addressbook *eudora_addressbook_load(const char *path) {
+    if (!path)
+        return nullptr;
+    auto loaded = AddressBook::load(path);
+    if (!loaded) {
+        set_error("cannot read address book");
+        return nullptr;
+    }
+    auto ab = std::make_unique<eudora_addressbook>();
+    ab->book = std::move(*loaded);
+    return ab.release();
+}
+
+eudora_addressbook *eudora_addressbook_parse(const char *text) {
+    if (!text)
+        return nullptr;
+    auto ab = std::make_unique<eudora_addressbook>();
+    ab->book = AddressBook::parse(text);
+    return ab.release();
+}
+
+void eudora_addressbook_free(eudora_addressbook *ab) { delete ab; }
+
+int eudora_addressbook_save(const eudora_addressbook *ab, const char *path) {
+    if (!ab || !path)
+        return 0;
+    return ab->book.save(path) ? 1 : 0;
+}
+
+int32_t eudora_addressbook_count(const eudora_addressbook *ab) {
+    return ab ? static_cast<int32_t>(ab->book.nicknames().size()) : 0;
+}
+
+const char *eudora_addressbook_name(const eudora_addressbook *ab, int32_t i) {
+    if (!ab || i < 0 || i >= eudora_addressbook_count(ab))
+        return nullptr;
+    return ab->book.nicknames()[static_cast<std::size_t>(i)].name.c_str();
+}
+
+const char *eudora_addressbook_addresses(const eudora_addressbook *ab,
+                                         int32_t i) {
+    if (!ab || i < 0 || i >= eudora_addressbook_count(ab))
+        return nullptr;
+    return ab->book.nicknames()[static_cast<std::size_t>(i)].addresses.c_str();
+}
+
+const char *eudora_addressbook_notes(const eudora_addressbook *ab, int32_t i) {
+    if (!ab || i < 0 || i >= eudora_addressbook_count(ab))
+        return nullptr;
+    return ab->book.nicknames()[static_cast<std::size_t>(i)].notes.c_str();
+}
+
+int eudora_addressbook_set(eudora_addressbook *ab, const char *name,
+                           const char *addresses, const char *notes) {
+    if (!ab || !name || !*name)
+        return 0;
+    Nickname n;
+    n.name = name;
+    n.addresses = addresses ? addresses : "";
+    n.notes = notes ? notes : "";
+    auto parsed = parse_addresses(n.addresses, false);
+    n.group = parsed && parsed->size() > 1;
+    ab->book.set(std::move(n));
+    return 1;
+}
+
+int eudora_addressbook_remove(eudora_addressbook *ab, const char *name) {
+    if (!ab || !name)
+        return 0;
+    return ab->book.remove(name) ? 1 : 0;
+}
+
+char **eudora_addressbook_expand(const eudora_addressbook *ab,
+                                 const char *address_list) {
+    if (!ab || !address_list)
+        return nullptr;
+    const auto expanded = ab->book.expand(address_list);
+    char **arr =
+        static_cast<char **>(std::calloc(expanded.size() + 1, sizeof(char *)));
+    if (!arr)
+        return nullptr;
+    for (std::size_t i = 0; i < expanded.size(); ++i)
+        arr[i] = dup_string(expanded[i]);
+    return arr;
+}
+
+int eudora_addressbook_contains(const eudora_addressbook *ab,
+                                const char *address) {
+    if (!ab || !address)
+        return 0;
+    return ab->book.contains_address(address) ? 1 : 0;
+}
+
 /* ---- filters ----------------------------------------------------------- */
 
 eudora_filters *eudora_filters_load(const char *path) {
@@ -625,6 +725,13 @@ int eudora_filters_save(const eudora_filters *f, const char *path) {
 eudora_fired_action *eudora_filters_run(const eudora_filters *f, int event,
                                         const char *raw_message, size_t len,
                                         int32_t *out_count) {
+    return eudora_filters_run_with_book(f, event, raw_message, len, nullptr,
+                                        out_count);
+}
+
+eudora_fired_action *eudora_filters_run_with_book(
+    const eudora_filters *f, int event, const char *raw_message, size_t len,
+    const eudora_addressbook *book, int32_t *out_count) {
     if (!f || !raw_message || !out_count)
         return nullptr;
     *out_count = 0;
@@ -637,6 +744,12 @@ eudora_fired_action *eudora_filters_run(const eudora_filters *f, int event,
 
     FilterContext ctx;
     ctx.raw_message = std::string_view(raw_message, len);
+    if (book) {
+        // Single-book model: the term's file name is not consulted.
+        ctx.address_in_book = [book](std::string_view addr, std::string_view) {
+            return book->book.contains_address(addr);
+        };
+    }
     const auto fired = run_filters(f->filters, ev, ctx);
     if (fired.empty())
         return nullptr;
