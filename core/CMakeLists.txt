@@ -65,7 +65,10 @@ target_sources(eudora_core PRIVATE
   protocols/md5.c
   protocols/sasl.cpp
   protocols/pop3.cpp
-  protocols/smtp.cpp)
+  protocols/smtp.cpp
+  filters/regexp.cpp
+  filters/filter_file.cpp
+  filters/match_engine.cpp)
 
 if(EUDORA_ENABLE_TLS)
   find_package(OpenSSL QUIET)
