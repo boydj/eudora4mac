@@ -61,30 +61,64 @@ What it recreates, and from where:
 - **The mailbox window** (`MailboxPane`) — the classic summary table with
   the Status / Priority / Attachments / Label / Who / Date / K / Subject
   columns (ColumnHead, STR# 26100), the original status glyphs
-  (• R F Q S), priority chevrons, and the 15-label color palette
-  (System 7 labels 1-7 plus PrivColors 27900 for 8-15), over a preview
-  pane. Context menus give Status / Label / Transfer / Delete — the
-  classic Message and Transfer menus.
+  (• R D F Q S T), priority chevrons, and the 15-label palette
+  (System 7 labels 1-7 plus PrivColors 27900 for 8-15 — names and colors
+  editable in Settings), over a preview pane. Double-click opens the
+  message in its own window; the Delete key files it in Trash.
 - **The Mailboxes sidebar** — In / Out / Trash / Junk first with unread
   counts, then user mailboxes; New Mailbox creation.
+- **Message actions** — Reply ⌘R / Reply to All ⇧⌘R (quoting under the
+  attribution line, honoring the Replying settings and PREF_NOT_ME),
+  Forward, Redirect (the classic "orig (by way of me)" From), Send
+  Again, Change Priority, Junk ⇧⌘J / Not Junk (junk transfer score),
+  Make Address Book Entry ⌘K — in the Message menu and the context menu.
+  Answered messages are marked replied/forwarded/redistributed.
 - **The composition window** (`ComposeView`) — Eudora's header block
-  (From / To / Subject / Cc / Bcc / Attached) over the body, with the
-  icon bar's priority popup and the two classic verbs: **Queue** (into
-  Out as QUEUED) and **Send** (SMTP now, copy kept in Out as SENT).
+  (From / To / Subject / Cc / Bcc / Attached) over the body, the icon
+  bar's priority popup, signature appending after the classic `-- `
+  separator, and the two classic verbs: **Queue** (into Out as QUEUED)
+  and **Send** (SMTP now, copy kept in Out as SENT).
+- **Attachments** — the preview pane lists a message's MIME attachment
+  parts (via the new `mail/mime_walker`) with click-to-save decoding;
+  multipart bodies display their first text part instead of raw
+  boundaries.
 - **The Filters window** (`FiltersView`) — the two-pane editor:
   filter list with up/down ordering, Match pane (incoming / outgoing /
   manual, header combo, the verb menu with the classic display names,
   conjunction, second term) and the Action pane (up to five actions),
-  reading and writing the real "Eudora Filters" file.
+  reading and writing the real "Eudora Filters" file.  Filter events run
+  as the original did: incoming after Check Mail, outgoing on Queue,
+  manual on ⌘J.  Executed actions: transfer, copy, junk score, label,
+  status, priority (incl. raise/lower), subject, sound, notify;
+  speak/open/print/forward/redirect/reply/personality remain inert.
 - **The Address Book window** — nicknames, addresses, notes, expansion
   preview, saved to the real "Eudora Nicknames" file.
-- **Settings** — personalities (dominant + alternates) with POP3/SMTP
-  hosts, security, credentials; the mail folder location. Stored as
-  `EudoraSettings.json` in the mail folder (move to Keychain for a
-  production build).
-- **Menus** — Message (Check Mail ⌘M, Send Queued Messages ⌘T, Filter
-  Messages ⌘J), Special (Filters…, Address Book… ⌘L, Empty Trash,
-  Compact Mailbox).
+- **Settings** — the classic panel-list dialog: Getting Started,
+  Personalities (POP3 **and IMAP** accounts, include-in-checks,
+  signature choice), Checking Mail (auto-check every N minutes,
+  send-on-check, leave-on-server days, skip-big-messages), Sending
+  Mail, Replying (quote prefix, attribution, reply-all-includes-self),
+  Signatures (files in the classic "Signature Folder"), Getting
+  Attention (alert / sound / Dock badge / open mailbox), Junk Mail
+  (threshold, transfer score, empty-after-days), Fonts & Display,
+  Labels, and the mail folder location. Stored as `EudoraSettings.json`
+  in the mail folder (move to Keychain for a production build); older
+  settings files load unchanged — decoding is tolerant of missing keys.
+- **Mail automation** — auto-check on the configured interval; after
+  each check the classic pipeline runs: incoming filters, the junk sweep
+  (score ≥ threshold moves to Junk), junk aging (old junk to Trash),
+  then Getting Attention (sound, notification — or a Dock bounce in a
+  bare `swift run` build, where the notification center is unavailable —
+  and the Dock unread badge).
+- **Menus** — Message (Check Mail ⌘M, Send Queued Messages ⌘T, the
+  message actions above, Filter Messages ⌘J, Delete ⌘⌫), Special
+  (Filters…, Address Book… ⌘L, Empty Trash, Compact Mailbox).
+
+Checking covers **every personality** marked include-in-checks — POP3
+accounts via `eudora_pop3_fetch_opts` (UIDL dedup, leave-on-server days,
+big-message skip) and IMAP accounts via `eudora_imap_fetch_ex`
+(UIDVALIDITY/UID dedup, flags mapped to states, optional
+delete-and-expunge) — all delivering into In.
 
 Everything operates on the classic on-disk formats, so a mail folder
 migrated from a real Mac (mailboxes + `.toc` files, "Eudora Filters",
@@ -96,8 +130,8 @@ The repository root carries a **Swift package** (`Package.swift`): add this
 repo as a package dependency in Xcode and `import EudoraKit` — SwiftPM
 compiles the C++ core itself (TLS included, via the Security framework)
 and `swift/EudoraKit` provides idiomatic types (`Mailbox`,
-`ParsedMessage`, `AddressBook`, `FilterSet`, `Composer`,
-`pop3Fetch`/`smtpSend`).
+`ParsedMessage` with `MessagePart` attachments, `AddressBook`,
+`FilterSet`, `Composer`, `pop3Fetch`/`imapFetch`/`smtpSend`).
 
 Underneath, `core/include/eudora/eudora_core.h` is a flat `extern "C"`
 interface usable from any language:
@@ -209,3 +243,12 @@ shipped, so `.toc` files in the wild are the mac68k layout.
   resource translation tables in the same situation).
 - POP3 command pipelining (the `POPCmds` stack) is not implemented;
   commands run sequentially.
+- Filter *terms* that match on the junk score (`less`/`greater` against
+  the summary) never match through `eudora_filters_run`: the C entry
+  point evaluates messages without their TOC summaries.  The junk
+  *action* (assigning a score) and the threshold sweep work fully.
+- The per-personality "delete from server when emptied from Trash"
+  option (PREF_SERVER_DEL) is stored but not yet honored.
+- IMAP accounts fetch INBOX into the local In mailbox (the classic
+  minimal-download flavor); folder browsing, flag write-back, and the
+  big-message/leave-on-server-days options are POP3-only for now.

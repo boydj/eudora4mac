@@ -31,6 +31,7 @@
 #elif defined(__APPLE__)
 #include "net/apple_tls_transport.hpp"
 #endif
+#include "protocols/imap.hpp"
 #include "protocols/pop3.hpp"
 #include "protocols/smtp.hpp"
 
@@ -807,6 +808,187 @@ int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
     return eudora_pop3_fetch_ex(host, port, tls_mode, user, password,
                                 mbox_path, delete_from_server, nullptr,
                                 nullptr);
+}
+
+/* ---- IMAP -------------------------------------------------------------- */
+
+int32_t eudora_imap_fetch_ex(const char *host, uint16_t port, int tls_mode,
+                             const char *user, const char *password,
+                             const char *imap_mailbox,
+                             const char *mbox_path, int delete_from_server,
+                             eudora_progress_fn progress, void *ctx) {
+    if (!host || !user || !password || !mbox_path) {
+        set_error("missing argument");
+        return -1;
+    }
+    const std::string remote_box =
+        imap_mailbox && *imap_mailbox ? imap_mailbox : "INBOX";
+
+    TransportBundle bundle;
+    Transport *transport = bundle.setup(tls_mode);
+    if (!transport)
+        return -1;
+    bundle.plain.set_recv_timeout(60);
+
+    std::atomic<bool> cancel_flag{false};
+    bundle.plain.set_cancel_flag(&cancel_flag);
+    if (bundle.active && bundle.active != &bundle.plain)
+        bundle.active->set_cancel_flag(&cancel_flag);
+    const auto report = [&](const char *stage, long done, long total) {
+        if (cancel_flag.load(std::memory_order_relaxed))
+            return false;
+        if (progress && progress(ctx, stage, static_cast<int32_t>(done),
+                                 static_cast<int32_t>(total)) != 0) {
+            cancel_flag.store(true, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    };
+
+    ImapSession imap(*transport);
+
+    if (!report("connect", 0, 0))
+        return 0;
+    if (transport->connect(host, port, 45) != NetError::None) {
+        set_error("cannot connect to " + std::string(host));
+        return -1;
+    }
+    if (tls_mode == EUDORA_TLS_IMMEDIATE && !bundle.start_tls(host))
+        return -1;
+    if (!imap.begin_connected()) {
+        set_error("no IMAP greeting");
+        return -1;
+    }
+    if (tls_mode == EUDORA_TLS_STARTTLS) {
+        if (!imap.request_starttls()) {
+            set_error("server refused STARTTLS: " + imap.last_response());
+            return -1;
+        }
+        if (!bundle.start_tls(host))
+            return -1;
+        imap.rescan_capabilities();
+    }
+    if (!report("auth", 0, 0))
+        return 0;
+    if (!imap.login(user, password)) {
+        set_error("authentication failed: " + imap.last_response());
+        return -1;
+    }
+
+    if (!report("list", 0, 0))
+        return 0;
+    ImapMailboxInfo info;
+    if (!imap.select(remote_box, info)) {
+        set_error("cannot select " + remote_box + ": " +
+                  imap.last_response());
+        return -1;
+    }
+
+    // Open (or create) the local mailbox and its TOC.
+    const std::filesystem::path box(mbox_path);
+    {
+        std::FILE *touch = std::fopen(box.string().c_str(), "ab");
+        if (!touch) {
+            set_error("cannot open mailbox for append");
+            return -1;
+        }
+        std::fclose(touch);
+    }
+    std::unique_ptr<eudora_mailbox> mb(eudora_mailbox_open(mbox_path));
+    if (!mb)
+        return -1;
+
+    // Enumerate UIDs and flags; dedup on kr_hash("uidvalidity/uid") — the
+    // IMAP analog of the POP UIDL bookkeeping.  An empty mailbox skips the
+    // 1:* fetch (some servers reject it outright).
+    struct WantedMsg {
+        std::uint32_t uid;
+        std::uint32_t hash;
+    };
+    std::vector<WantedMsg> wanted;
+    std::vector<std::uint32_t> already;
+    if (info.exists > 0) {
+        const auto listing = imap.uid_fetch("1:*", "(UID FLAGS)");
+        if (!listing) {
+            set_error("UID FETCH failed: " + imap.last_response());
+            return -1;
+        }
+        for (const auto &r : *listing) {
+            if (r.uid == 0)
+                continue;
+            const std::uint32_t h =
+                kr_hash(std::to_string(info.uid_validity) + "/" +
+                        std::to_string(r.uid));
+            if (valid_hash(h) && mb->toc.find_by_hash(h) >= 0)
+                already.push_back(r.uid);
+            else
+                wanted.push_back({r.uid, h});
+        }
+    }
+
+    int32_t fetched = 0;
+    bool ok = true;
+    std::vector<std::uint32_t> to_delete;
+    if (delete_from_server)
+        to_delete = already;
+
+    const long total = static_cast<long>(wanted.size());
+    for (long i = 0; i < total && ok; ++i) {
+        if (!report("retr", i, total))
+            break;
+        const WantedMsg &w = wanted[static_cast<std::size_t>(i)];
+        const auto result =
+            imap.uid_fetch(std::to_string(w.uid), "(UID FLAGS BODY.PEEK[])");
+        if (!result) {
+            set_error("UID FETCH failed: " + imap.last_response());
+            ok = false;
+            break;
+        }
+        const ImapFetchResult *msg = nullptr;
+        for (const auto &r : *result)
+            if (r.uid == w.uid && !r.body.empty())
+                msg = &r;
+        if (!msg)
+            continue; // vanished between listing and fetch
+        const int32_t idx = eudora_mailbox_append_message(
+            mb.get(), msg->body.data(), msg->body.size(),
+            imap_flags_to_state(msg->flags));
+        if (idx < 0) {
+            ok = false;
+            break;
+        }
+        if (valid_hash(w.hash))
+            mb->toc.sums[static_cast<std::size_t>(idx)].uid_hash = w.hash;
+        ++fetched;
+        if (delete_from_server)
+            to_delete.push_back(w.uid);
+    }
+
+    const bool cancelled = cancel_flag.load(std::memory_order_relaxed);
+    if (!cancelled) {
+        report("retr", fetched, total);
+        if (ok && delete_from_server && !to_delete.empty()) {
+            std::string uid_set;
+            for (const std::uint32_t uid : to_delete) {
+                if (!uid_set.empty())
+                    uid_set += ',';
+                uid_set += std::to_string(uid);
+            }
+            if (imap.uid_store(uid_set, "+FLAGS.SILENT", "\\Deleted"))
+                imap.expunge();
+        }
+        imap.logout();
+    }
+
+    if (!write_toc(mb->toc, mb->toc_file)) {
+        set_error("cannot write TOC");
+        return -1;
+    }
+    if (cancelled) {
+        set_error("cancelled");
+        return fetched;
+    }
+    return ok ? fetched : -1;
 }
 
 /* ---- SMTP -------------------------------------------------------------- */

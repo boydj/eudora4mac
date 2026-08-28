@@ -749,6 +749,41 @@ public func pop3Fetch(host: String, port: UInt16, tls: TLSMode = .none,
     return Int(n)
 }
 
+/// Fetches new messages from an IMAP mailbox (default INBOX) into the local
+/// mailbox at `mailboxPath`.  Messages already fetched are recognized by
+/// their UIDVALIDITY/UID and skipped; server flags choose the initial state
+/// (\Seen -> read).  deleteFromServer flags fetched messages \Deleted and
+/// expunges.  Progress and cancellation exactly as `pop3Fetch`.
+public func imapFetch(host: String, port: UInt16, tls: TLSMode = .none,
+                      user: String, password: String,
+                      imapMailbox: String = "INBOX",
+                      mailboxPath: String, deleteFromServer: Bool = false,
+                      progress: FetchProgress? = nil) throws -> Int {
+    let n: Int32
+    if let progress {
+        let box = FetchProgressBox(progress)
+        n = withExtendedLifetime(box) {
+            eudora_imap_fetch_ex(
+                host, port, tls.rawValue, user, password, imapMailbox,
+                mailboxPath, deleteFromServer ? 1 : 0,
+                { ctx, stage, done, total in
+                    guard let ctx, let stage else { return 0 }
+                    let box = Unmanaged<FetchProgressBox>.fromOpaque(ctx)
+                        .takeUnretainedValue()
+                    return box.callback(String(cString: stage),
+                                        Int(done), Int(total)) ? 0 : 1
+                },
+                Unmanaged.passUnretained(box).toOpaque())
+        }
+    } else {
+        n = eudora_imap_fetch_ex(host, port, tls.rawValue, user, password,
+                                 imapMailbox, mailboxPath,
+                                 deleteFromServer ? 1 : 0, nil, nil)
+    }
+    guard n >= 0 else { throw EudoraError.fromLast() }
+    return Int(n)
+}
+
 /// Sends a fully formed RFC 822 message.  Returns the final SMTP code.
 @discardableResult
 public func smtpSend(host: String, port: UInt16, tls: TLSMode = .none,

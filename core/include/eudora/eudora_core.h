@@ -223,6 +223,22 @@ int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
                                const eudora_pop3_options *options,
                                eudora_progress_fn progress, void *ctx);
 
+/* ---- IMAP -------------------------------------------------------------- */
+
+/* Fetch new messages from an IMAP mailbox (imap_mailbox NULL/"" = INBOX)
+ * into the local mailbox at mbox_path.  Messages already fetched are
+ * recognized by the hash of "UIDVALIDITY/UID" stored in their summaries —
+ * the IMAP analog of the POP UIDL bookkeeping (a UIDVALIDITY change
+ * naturally re-fetches, per RFC 3501).  Server flags choose the initial
+ * state (\Seen -> read, \Answered -> replied).  delete_from_server flags
+ * fetched (and previously fetched) messages \Deleted and expunges.
+ * Progress stages and cancellation exactly as eudora_pop3_fetch_ex. */
+int32_t eudora_imap_fetch_ex(const char *host, uint16_t port, int tls_mode,
+                             const char *user, const char *password,
+                             const char *imap_mailbox,
+                             const char *mbox_path, int delete_from_server,
+                             eudora_progress_fn progress, void *ctx);
+
 /* ---- SMTP -------------------------------------------------------------- */
 
 /* Send a fully formed RFC 822 message (CR, LF, or CRLF line ends).

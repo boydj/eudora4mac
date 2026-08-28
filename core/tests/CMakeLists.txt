@@ -8,7 +8,8 @@ set(EUDORA_TEST_SOURCES
   test_c_api.cpp
   test_addressbook.cpp
   test_composer.cpp
-  test_imap.cpp)
+  test_imap.cpp
+  test_imap_fetch.cpp)
 
 foreach(src ${EUDORA_TEST_SOURCES})
   get_filename_component(name ${src} NAME_WE)

@@ -424,10 +424,14 @@ final class AppModel: ObservableObject {
 
     private let checkMailCancel = CancelFlag()
 
+    /// Check every personality marked include-in-checks, POP3 or IMAP,
+    /// delivering into In.
     func checkMail(auto: Bool = false) {
         guard !isCheckingMail else { return }
-        let account = settings.dominant
-        guard !account.popHost.isEmpty else {
+        let accounts = settings.personalities.filter {
+            $0.includeInChecks && !$0.popHost.isEmpty
+        }
+        guard !accounts.isEmpty else {
             if !auto { statusText = "Set up a personality in Settings first." }
             return
         }
@@ -436,15 +440,40 @@ final class AppModel: ObservableObject {
             sendQueuedMessages(quiet: true)
         }
         isCheckingMail = true
-        statusText = "Checking mail at \(account.popHost)…"
+        statusText = "Checking mail…"
         let inboxPath = mailFolder.appendingPathComponent("In").path
-        let host = account.popHost
         checkMailCancel.reset()
         let cancel = checkMailCancel
+        let multi = accounts.count > 1
 
         Task.detached {
-            let result: Result<Int, Error>
-            do {
+            var total = 0
+            var failure: String?
+            for account in accounts {
+                if cancel.isCancelled { break }
+                let prefix = multi ? "\(account.name): " : ""
+                let host = account.popHost
+                let progress: FetchProgress = { stage, done, msgTotal in
+                    let text: String
+                    switch stage {
+                    case "connect": text = "\(prefix)Connecting to \(host)…"
+                    case "auth": text = "\(prefix)Logging in…"
+                    case "list": text = "\(prefix)Looking for new mail…"
+                    case "retr":
+                        if msgTotal == 0 {
+                            text = "\(prefix)No new mail on the server."
+                        } else if done >= msgTotal {
+                            text = "\(prefix)Retrieved \(msgTotal) message\(msgTotal == 1 ? "" : "s")."
+                        } else {
+                            text = "\(prefix)Retrieving message \(done + 1) of \(msgTotal)…"
+                        }
+                    default: text = "\(prefix)Checking mail at \(host)…"
+                    }
+                    Task { @MainActor [weak self] in
+                        self?.statusText = text
+                    }
+                    return !cancel.isCancelled
+                }
                 let tls: TLSMode = {
                     switch account.popSecurity {
                     case .none: return .none
@@ -452,57 +481,51 @@ final class AppModel: ObservableObject {
                     case .immediateTLS: return .immediate
                     }
                 }()
-                let n = try pop3Fetch(host: account.popHost, port: account.popPort,
-                                      tls: tls, user: account.username,
-                                      password: account.password,
-                                      mailboxPath: inboxPath,
-                                      deleteFromServer: !account.leaveOnServer,
-                                      maxMessageK: account.skipBigMessages
-                                          ? account.bigMessageLimitK : 0,
-                                      leaveOnServerDays: account.leaveOnServer
-                                          ? account.leaveOnServerDays : 0,
-                                      progress: { stage, done, total in
-                    let text: String
-                    switch stage {
-                    case "connect": text = "Connecting to \(host)…"
-                    case "auth": text = "Logging in…"
-                    case "list": text = "Looking for new mail…"
-                    case "retr":
-                        if total == 0 {
-                            text = "No new mail on the server."
-                        } else if done >= total {
-                            text = "Retrieved \(total) message\(total == 1 ? "" : "s")."
-                        } else {
-                            text = "Retrieving message \(done + 1) of \(total)…"
-                        }
-                    default: text = "Checking mail at \(host)…"
+                do {
+                    let n: Int
+                    switch account.accountType {
+                    case .pop3:
+                        n = try pop3Fetch(
+                            host: host, port: account.popPort, tls: tls,
+                            user: account.username,
+                            password: account.password,
+                            mailboxPath: inboxPath,
+                            deleteFromServer: !account.leaveOnServer,
+                            maxMessageK: account.skipBigMessages
+                                ? account.bigMessageLimitK : 0,
+                            leaveOnServerDays: account.leaveOnServer
+                                ? account.leaveOnServerDays : 0,
+                            progress: progress)
+                    case .imap:
+                        n = try imapFetch(
+                            host: host, port: account.popPort, tls: tls,
+                            user: account.username,
+                            password: account.password,
+                            mailboxPath: inboxPath,
+                            deleteFromServer: !account.leaveOnServer,
+                            progress: progress)
                     }
-                    Task { @MainActor [weak self] in
-                        self?.statusText = text
-                    }
-                    return !cancel.isCancelled
-                })
-                result = .success(n)
-            } catch {
-                result = .failure(error)
+                    total += n
+                } catch {
+                    failure = "\(multi ? account.name + ": " : "")\(error)"
+                    break
+                }
             }
+            let totalFinal = total
+            let failureFinal = failure
             let wasStopped = cancel.isCancelled
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isCheckingMail = false
-                switch result {
-                case .success(let n):
-                    self.postCheckPipeline(newCount: wasStopped ? 0 : n)
-                    if wasStopped {
-                        self.statusText = n == 0 ? "Mail check stopped."
-                            : "Mail check stopped after \(n) message\(n == 1 ? "" : "s")."
-                    } else {
-                        self.statusText = n == 0 ? "You have no new mail."
-                            : "You have \(n) new message\(n == 1 ? "" : "s")."
-                    }
-                case .failure(let error):
-                    self.refreshMailbox(named: "In")
-                    self.statusText = "Check failed: \(error)"
+                self.postCheckPipeline(newCount: wasStopped ? 0 : totalFinal)
+                if let failure = failureFinal {
+                    self.statusText = "Check failed: \(failure)"
+                } else if wasStopped {
+                    self.statusText = totalFinal == 0 ? "Mail check stopped."
+                        : "Mail check stopped after \(totalFinal) message\(totalFinal == 1 ? "" : "s")."
+                } else {
+                    self.statusText = totalFinal == 0 ? "You have no new mail."
+                        : "You have \(totalFinal) new message\(totalFinal == 1 ? "" : "s")."
                 }
             }
         }
