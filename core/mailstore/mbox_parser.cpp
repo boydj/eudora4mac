@@ -8,6 +8,7 @@
 
 #include "compat/hashes.hpp"
 #include "compat/macdate.hpp"
+#include "mail/rfc2047.hpp"
 #include "mailstore/toc_format.hpp"
 
 namespace eudora {
@@ -603,7 +604,7 @@ bool MboxScanner::next(MessageSummary &out) {
                 if (!options_.is_out && maybe_out >= kAttachHead + 1) {
                     // Headers ran in exact composition order: this is an
                     // outgoing message stored in a regular mailbox.
-                    sum.from = beautify_from(header_value(to_line));
+                    sum.from = beautify_from(decode_rfc2047(header_value(to_line)));
                     if (!sum.from.empty())
                         sum.state = MessageState::Unsent;
                     sum.flags = out_flags;
@@ -650,7 +651,7 @@ bool MboxScanner::next(MessageSummary &out) {
                 }
                 case tchTo:
                     if (options_.is_out) {
-                        sum.from = beautify_from(header_value(line));
+                        sum.from = beautify_from(decode_rfc2047(header_value(line)));
                         if (!sum.from.empty())
                             sum.state = MessageState::Sendable;
                     } else if (maybe_out != 0) {
@@ -662,7 +663,7 @@ bool MboxScanner::next(MessageSummary &out) {
                     if (options_.is_out || maybe_out > 0) {
                         if (options_.is_out &&
                             (sum.from.empty() || sum.from.front() == '?')) {
-                            sum.from = beautify_from(header_value(line));
+                            sum.from = beautify_from(decode_rfc2047(header_value(line)));
                             if (!sum.from.empty())
                                 sum.state = MessageState::Sendable;
                         } else if (to_line.empty()) {
@@ -671,7 +672,7 @@ bool MboxScanner::next(MessageSummary &out) {
                     }
                     break;
                 case tchSubject:
-                    sum.subject = beautify_subject(header_value(line),
+                    sum.subject = beautify_subject(decode_rfc2047(header_value(line)),
                                                    options_.outlook_fix);
                     break;
                 case tchStatus:
@@ -718,7 +719,7 @@ bool MboxScanner::next(MessageSummary &out) {
                             if (!(sum.opts & sumopt::kBulk) && is_bulk_sender(line))
                                 sum.opts |= sumopt::kBulk;
                             if (sh <= sender_head) {
-                                sum.from = beautify_from(header_value(line));
+                                sum.from = beautify_from(decode_rfc2047(header_value(line)));
                                 sender_head = sh;
                             }
                             break;
@@ -737,7 +738,7 @@ bool MboxScanner::next(MessageSummary &out) {
                 // Continuation of a wrapped Subject: line.
                 std::string cont(trim_white(trim_terminator(line)));
                 std::replace(cont.begin(), cont.end(), '\t', ' ');
-                sum.subject += beautify_subject(cont, options_.outlook_fix);
+                sum.subject += beautify_subject(decode_rfc2047(cont), options_.outlook_fix);
             }
             continue;
         }

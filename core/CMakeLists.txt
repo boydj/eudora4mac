@@ -31,10 +31,12 @@ option(EUDORA_BUILD_TESTS "Build unit tests" ON)
 
 add_library(eudora_core STATIC)
 
+# Both the curated public headers (include/eudora) and the module headers
+# (compat/, mailstore/, mail/, net/, protocols/, filters/) are consumable;
+# Swift/Cocoa frontends normally use only include/eudora.
 target_include_directories(eudora_core
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-  PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(MSVC)
@@ -68,7 +70,8 @@ target_sources(eudora_core PRIVATE
   protocols/smtp.cpp
   filters/regexp.cpp
   filters/filter_file.cpp
-  filters/match_engine.cpp)
+  filters/match_engine.cpp
+  api/eudora_core_c.cpp)
 
 if(EUDORA_ENABLE_TLS)
   find_package(OpenSSL QUIET)

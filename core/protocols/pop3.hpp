@@ -51,6 +51,10 @@ public:
     bool connect(const std::string &host, std::uint16_t port,
                  long timeout_seconds = 45);
 
+    // For transports connected (and possibly TLS-wrapped) externally:
+    // just read the greeting banner.
+    bool begin_connected();
+
     // CAPA (PopCapabilities).
     const Pop3Capabilities &query_capabilities();
 

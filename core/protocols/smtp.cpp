@@ -126,6 +126,10 @@ bool SmtpSession::connect(const std::string &host, std::uint16_t port,
         last_code_ = 601;
         return false;
     }
+    return begin_connected(helo_name);
+}
+
+bool SmtpSession::begin_connected(const std::string &helo_name) {
     connected_ = true;
     helo_name_ = helo_name.empty() ? transport_.local_host_name() : helo_name;
 

@@ -39,6 +39,10 @@ public:
     bool connect(const std::string &host, std::uint16_t port,
                  long timeout_seconds = 45, const std::string &helo_name = "");
 
+    // For transports connected (and possibly TLS-wrapped) externally:
+    // read the greeting and run EHLO/HELO.
+    bool begin_connected(const std::string &helo_name = "");
+
     const SmtpExtensions &extensions() const { return ext_; }
 
     // STARTTLS: issue the command; on 2xx the caller runs the handshake and

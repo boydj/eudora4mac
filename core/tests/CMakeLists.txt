@@ -3,7 +3,8 @@ set(EUDORA_TEST_SOURCES
   test_mailstore.cpp
   test_mail.cpp
   test_protocols.cpp
-  test_filters.cpp)
+  test_filters.cpp
+  test_c_api.cpp)
 
 foreach(src ${EUDORA_TEST_SOURCES})
   get_filename_component(name ${src} NAME_WE)

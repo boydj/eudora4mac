@@ -72,6 +72,10 @@ bool Pop3Session::connect(const std::string &host, std::uint16_t port,
                           long timeout_seconds) {
     if (transport_.connect(host, port, timeout_seconds) != NetError::None)
         return false;
+    return begin_connected();
+}
+
+bool Pop3Session::begin_connected() {
     // Read the banner; loop past any junk before +/- (POPIntroductions).
     if (!command(""))
         return false;
