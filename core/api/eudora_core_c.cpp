@@ -182,6 +182,15 @@ int eudora_mailbox_set_state(eudora_mailbox *mb, int32_t index, uint8_t state) {
     return 1;
 }
 
+int eudora_mailbox_set_label(eudora_mailbox *mb, int32_t index, int label) {
+    if (!mb || index < 0 || index >= mb->toc.count() || label < 0 || label > 15)
+        return 0;
+    auto &flags = mb->toc.sums[static_cast<std::size_t>(index)].flags;
+    flags = (flags & ~(0xFu << 14)) |
+            (static_cast<std::uint32_t>(label) << 14);
+    return 1;
+}
+
 int eudora_mailbox_delete(eudora_mailbox *mb, int32_t index) {
     if (!mb)
         return 0;
@@ -396,6 +405,72 @@ std::string envelope_from_line(const HeaderSet &hs) {
 
 } // namespace
 
+int32_t eudora_mailbox_append_message(eudora_mailbox *mb, const char *raw,
+                                      size_t len, uint8_t state) {
+    if (!mb || !raw) {
+        set_error("missing argument");
+        return -1;
+    }
+    // Normalize to the mailbox's CR line-end convention.
+    std::string message;
+    message.reserve(len);
+    for (std::size_t i = 0; i < len; ++i) {
+        const char c = raw[i];
+        if (c == '\r') {
+            message += '\r';
+            if (i + 1 < len && raw[i + 1] == '\n')
+                ++i;
+        } else if (c == '\n') {
+            message += '\r';
+        } else {
+            message += c;
+        }
+    }
+    if (message.empty() || message.back() != '\r')
+        message += '\r';
+
+    const auto parts = split_message(message);
+    const HeaderSet hs = HeaderSet::parse(parts.header_block);
+    const std::string envelope = envelope_from_line(hs);
+
+    std::FILE *out = std::fopen(mb->toc.mailbox_path.string().c_str(), "ab");
+    if (!out) {
+        set_error("cannot append to mailbox");
+        return -1;
+    }
+    std::fseek(out, 0, SEEK_END);
+    const std::int64_t start = std::ftell(out);
+    const bool ok =
+        std::fwrite(envelope.data(), 1, envelope.size(), out) == envelope.size() &&
+        std::fwrite(message.data(), 1, message.size(), out) == message.size();
+    std::fclose(out);
+    if (!ok) {
+        set_error("cannot write to mailbox");
+        return -1;
+    }
+
+    LineReader reader;
+    MessageSummary sum;
+    if (!reader.open(mb->toc.mailbox_path) || !reader.seek(start)) {
+        set_error("cannot rescan mailbox");
+        return -1;
+    }
+    MboxScanner scanner(reader, MboxParseOptions{});
+    if (!scanner.next(sum)) {
+        set_error("appended message did not scan");
+        return -1;
+    }
+    if (state)
+        sum.state = static_cast<MessageState>(state);
+    mb->toc.append(std::move(sum));
+
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(mb->toc.mailbox_path, ec);
+    if (!ec)
+        mb->toc.recalc_kbytes(static_cast<std::int64_t>(size));
+    return mb->toc.count() - 1;
+}
+
 int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
                           const char *user, const char *password,
                           const char *mbox_path, int delete_from_server) {
@@ -456,12 +531,6 @@ int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
     if (!mb)
         return -1;
 
-    std::FILE *out = std::fopen(box.string().c_str(), "ab");
-    if (!out) {
-        set_error("cannot append to mailbox");
-        return -1;
-    }
-
     int32_t fetched = 0;
     bool ok = true;
     for (long m = 1; m <= count && ok; ++m) {
@@ -473,47 +542,20 @@ int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
             set_error("RETR failed: " + pop.last_response());
             break;
         }
-        if (!message.empty() && message.back() != '\r')
-            message += '\r';
-
-        const auto parts = split_message(message);
-        const HeaderSet hs = HeaderSet::parse(parts.header_block);
-        const std::string envelope = envelope_from_line(hs);
-
-        const std::int64_t start = std::ftell(out);
-        ok = std::fwrite(envelope.data(), 1, envelope.size(), out) ==
-                 envelope.size() &&
-             std::fwrite(message.data(), 1, message.size(), out) ==
-                 message.size();
-        if (!ok) {
-            set_error("cannot write to mailbox");
+        if (eudora_mailbox_append_message(mb.get(), message.data(),
+                                          message.size(), 0) < 0) {
+            ok = false;
             break;
         }
-        std::fflush(out);
-
-        // Build the summary by scanning the appended region (BuildTOC-style).
-        LineReader reader;
-        if (reader.open(box) && reader.seek(start)) {
-            MboxScanner scanner(reader, MboxParseOptions{});
-            MessageSummary sum;
-            if (scanner.next(sum)) {
-                mb->toc.append(std::move(sum));
-                ++fetched;
-            }
-        }
+        ++fetched;
 
         if (delete_from_server && !pop.dele(m)) {
             set_error("DELE failed: " + pop.last_response());
             ok = false;
         }
     }
-    std::fclose(out);
     pop.quit();
 
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(box, ec);
-    if (!ec)
-        mb->toc.recalc_kbytes(static_cast<std::int64_t>(size));
     if (!write_toc(mb->toc, mb->toc_file)) {
         set_error("cannot write TOC");
         return -1;
@@ -800,10 +842,207 @@ eudora_filters *eudora_filters_parse(const char *text) {
     return f.release();
 }
 
+eudora_filters *eudora_filters_new(void) { return new eudora_filters(); }
+
 void eudora_filters_free(eudora_filters *f) { delete f; }
 
 int32_t eudora_filters_count(const eudora_filters *f) {
     return f ? static_cast<int32_t>(f->filters.size()) : 0;
+}
+
+namespace {
+
+Filter *filter_at_mut(eudora_filters *f, int32_t index) {
+    if (!f || index < 0 || index >= static_cast<int32_t>(f->filters.size()))
+        return nullptr;
+    return &f->filters[static_cast<std::size_t>(index)];
+}
+
+const Filter *filter_at(const eudora_filters *f, int32_t index) {
+    return filter_at_mut(const_cast<eudora_filters *>(f), index);
+}
+
+// Static storage for the enum-name strings handed back by _get.
+const char *verb_cstr(FilterVerb v) {
+    switch (v) {
+    case FilterVerb::Contains: return "contains";
+    case FilterVerb::NotContains: return "!contains";
+    case FilterVerb::Is: return "is";
+    case FilterVerb::Isnt: return "!is";
+    case FilterVerb::Starts: return "starts";
+    case FilterVerb::Ends: return "ends";
+    case FilterVerb::Appears: return "appears";
+    case FilterVerb::NotAppears: return "!appears";
+    case FilterVerb::Intersects: return "intersects";
+    case FilterVerb::NotIntersects: return "disjoint";
+    case FilterVerb::IntersectsFile: return "intersectsFile";
+    case FilterVerb::NotIntersectsFile: return "disjointFile";
+    case FilterVerb::Regex: return "regex";
+    case FilterVerb::JunkLess: return "less";
+    case FilterVerb::JunkMore: return "greater";
+    }
+    return "contains";
+}
+
+const char *conjunction_cstr(FilterConjunction c) {
+    switch (c) {
+    case FilterConjunction::And: return "and";
+    case FilterConjunction::Or: return "or";
+    case FilterConjunction::Unless: return "unless";
+    default: return "ignore";
+    }
+}
+
+} // namespace
+
+int eudora_filters_get(const eudora_filters *f, int32_t index,
+                       eudora_filter_info *out) {
+    const Filter *fr = filter_at(f, index);
+    if (!fr || !out)
+        return 0;
+    out->name = fr->name.c_str();
+    out->id = fr->id;
+    out->incoming = fr->incoming ? 1 : 0;
+    out->outgoing = fr->outgoing ? 1 : 0;
+    out->manual = fr->manual ? 1 : 0;
+    out->header1 = fr->terms[0].header.c_str();
+    out->verb1 = verb_cstr(fr->terms[0].verb);
+    out->value1 = fr->terms[0].value.c_str();
+    out->conjunction = conjunction_cstr(fr->conjunction);
+    out->header2 = fr->terms[1].header.c_str();
+    out->verb2 = verb_cstr(fr->terms[1].verb);
+    out->value2 = fr->terms[1].value.c_str();
+    return 1;
+}
+
+int eudora_filters_set(eudora_filters *f, int32_t index,
+                       const eudora_filter_info *in) {
+    Filter *fr = filter_at_mut(f, index);
+    if (!fr || !in)
+        return 0;
+    if (in->name)
+        fr->name = in->name;
+    fr->incoming = in->incoming != 0;
+    fr->outgoing = in->outgoing != 0;
+    fr->manual = in->manual != 0;
+    if (in->header1)
+        fr->terms[0].header = in->header1;
+    if (in->verb1) {
+        if (auto v = filter_verb_from_string(in->verb1))
+            fr->terms[0].verb = *v;
+    }
+    if (in->value1) {
+        fr->terms[0].value = in->value1;
+        fr->terms[0].regex_cache.reset();
+    }
+    if (in->conjunction) {
+        if (auto c = filter_conjunction_from_string(in->conjunction))
+            fr->conjunction = *c;
+    }
+    if (in->header2)
+        fr->terms[1].header = in->header2;
+    if (in->verb2) {
+        if (auto v = filter_verb_from_string(in->verb2))
+            fr->terms[1].verb = *v;
+    }
+    if (in->value2) {
+        fr->terms[1].value = in->value2;
+        fr->terms[1].regex_cache.reset();
+    }
+    return 1;
+}
+
+int32_t eudora_filters_add(eudora_filters *f, const char *name) {
+    if (!f)
+        return -1;
+    Filter fr;
+    fr.name = name && *name ? name : "Untitled";
+    fr.incoming = true;
+    std::int32_t max_id = 0;
+    for (const auto &existing : f->filters)
+        if (existing.id > max_id)
+            max_id = existing.id;
+    fr.id = max_id + 1;
+    f->filters.push_back(std::move(fr));
+    return static_cast<int32_t>(f->filters.size()) - 1;
+}
+
+int eudora_filters_remove(eudora_filters *f, int32_t index) {
+    if (!filter_at_mut(f, index))
+        return 0;
+    f->filters.erase(f->filters.begin() + index);
+    return 1;
+}
+
+int eudora_filters_move(eudora_filters *f, int32_t from, int32_t to) {
+    if (!filter_at_mut(f, from) || !filter_at_mut(f, to))
+        return 0;
+    Filter moved = std::move(f->filters[static_cast<std::size_t>(from)]);
+    f->filters.erase(f->filters.begin() + from);
+    f->filters.insert(f->filters.begin() + to, std::move(moved));
+    return 1;
+}
+
+int32_t eudora_filter_action_count(const eudora_filters *f, int32_t index) {
+    const Filter *fr = filter_at(f, index);
+    return fr ? static_cast<int32_t>(fr->actions.size()) : 0;
+}
+
+int eudora_filter_action_get(const eudora_filters *f, int32_t index,
+                             int32_t action, const char **keyword,
+                             const char **value) {
+    const Filter *fr = filter_at(f, index);
+    if (!fr || action < 0 ||
+        action >= static_cast<int32_t>(fr->actions.size()))
+        return 0;
+    const FilterAction &a = fr->actions[static_cast<std::size_t>(action)];
+    if (keyword) {
+        const std::string_view kw = filter_keyword_string(a.keyword);
+        *keyword = kw.data(); // static table entries are NUL-terminated
+    }
+    if (value)
+        *value = a.value.c_str();
+    return 1;
+}
+
+int eudora_filter_action_add(eudora_filters *f, int32_t index,
+                             const char *keyword, const char *value) {
+    Filter *fr = filter_at_mut(f, index);
+    if (!fr || !keyword)
+        return 0;
+    const FilterKeyword k = filter_keyword_from_string(keyword);
+    if (!filter_keyword_is_action(k))
+        return 0;
+    fr->actions.push_back({k, value ? value : ""});
+    return 1;
+}
+
+int eudora_filter_action_set(eudora_filters *f, int32_t index, int32_t action,
+                             const char *keyword, const char *value) {
+    Filter *fr = filter_at_mut(f, index);
+    if (!fr || action < 0 ||
+        action >= static_cast<int32_t>(fr->actions.size()))
+        return 0;
+    FilterAction &a = fr->actions[static_cast<std::size_t>(action)];
+    if (keyword) {
+        const FilterKeyword k = filter_keyword_from_string(keyword);
+        if (!filter_keyword_is_action(k))
+            return 0;
+        a.keyword = k;
+    }
+    if (value)
+        a.value = value;
+    return 1;
+}
+
+int eudora_filter_action_remove(eudora_filters *f, int32_t index,
+                                int32_t action) {
+    Filter *fr = filter_at_mut(f, index);
+    if (!fr || action < 0 ||
+        action >= static_cast<int32_t>(fr->actions.size()))
+        return 0;
+    fr->actions.erase(fr->actions.begin() + action);
+    return 1;
 }
 
 int eudora_filters_save(const eudora_filters *f, const char *path) {

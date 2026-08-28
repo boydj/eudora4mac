@@ -262,6 +262,123 @@ TEST_CASE("C API: POP3 fetch against a live localhost server") {
 }
 #endif // !_WIN32
 
+TEST_CASE("C API: mailbox append message") {
+    const fs::path box = temp_dir() / "AppendBox";
+    write_file(box, kMailbox);
+    eudora_mailbox *mb = eudora_mailbox_open(box.string().c_str());
+    CHECK(mb != nullptr);
+    if (!mb)
+        return;
+    CHECK_EQ(eudora_mailbox_count(mb), 1);
+
+    // LF-terminated draft gets normalized, enveloped, and summarized.
+    const std::string draft =
+        "From: me@example.com\nTo: you@example.org\nSubject: queued draft\n"
+        "\nsend me later\n";
+    const int32_t idx = eudora_mailbox_append_message(
+        mb, draft.data(), draft.size(), EUDORA_STATE_QUEUED);
+    CHECK_EQ(idx, 1);
+    eudora_summary sum{};
+    CHECK(eudora_mailbox_summary(mb, 1, &sum));
+    CHECK_EQ(std::string(sum.subject), "queued draft");
+    CHECK(sum.state == EUDORA_STATE_QUEUED);
+    CHECK(eudora_mailbox_save(mb));
+    char *raw = eudora_mailbox_read_message(mb, 1);
+    CHECK(raw != nullptr);
+    if (raw) {
+        CHECK(std::strncmp(raw, "From me@example.com ", 20) == 0);
+        CHECK(std::strstr(raw, "send me later\r") != nullptr);
+        eudora_string_free(raw);
+    }
+
+    CHECK(eudora_mailbox_set_label(mb, 1, 5));
+    CHECK(eudora_mailbox_summary(mb, 1, &sum));
+    CHECK_EQ((sum.flags >> 14) & 0xF, 5u);
+    eudora_mailbox_close(mb);
+
+    // Reopen: the TOC still matches the enlarged mailbox.
+    mb = eudora_mailbox_open(box.string().c_str());
+    CHECK(mb != nullptr);
+    if (mb) {
+        CHECK_EQ(eudora_mailbox_count(mb), 2);
+        eudora_mailbox_close(mb);
+    }
+}
+
+TEST_CASE("C API: filter editing surface") {
+    eudora_filters *f = eudora_filters_new();
+    CHECK(f != nullptr);
+    if (!f)
+        return;
+    CHECK_EQ(eudora_filters_count(f), 0);
+
+    const int32_t i = eudora_filters_add(f, "My rule");
+    CHECK_EQ(i, 0);
+
+    eudora_filter_info info{};
+    CHECK(eudora_filters_get(f, i, &info));
+    CHECK_EQ(std::string(info.name), "My rule");
+    CHECK(info.incoming == 1);
+
+    eudora_filter_info edit{};
+    edit.name = "Spam rule";
+    edit.incoming = 1;
+    edit.manual = 1;
+    edit.header1 = "subject:";
+    edit.verb1 = "contains";
+    edit.value1 = "viagra";
+    edit.conjunction = "or";
+    edit.header2 = "«any header»";
+    edit.verb2 = "contains";
+    edit.value2 = "lottery";
+    CHECK(eudora_filters_set(f, i, &edit));
+
+    CHECK(eudora_filter_action_add(f, i, "junk", "95"));
+    CHECK(eudora_filter_action_add(f, i, "stop", ""));
+    CHECK(!eudora_filter_action_add(f, i, "rule", "x")); // not an action
+    CHECK_EQ(eudora_filter_action_count(f, i), 2);
+    const char *kw = nullptr, *val = nullptr;
+    CHECK(eudora_filter_action_get(f, i, 0, &kw, &val));
+    CHECK_EQ(std::string(kw), "junk");
+    CHECK_EQ(std::string(val), "95");
+
+    // Serialized set round trips through the classic file format.
+    const fs::path ff = temp_dir() / "EditedFilters";
+    CHECK(eudora_filters_save(f, ff.string().c_str()));
+    eudora_filters *again = eudora_filters_load(ff.string().c_str());
+    CHECK(again != nullptr);
+    if (again) {
+        CHECK_EQ(eudora_filters_count(again), 1);
+        eudora_filter_info back{};
+        CHECK(eudora_filters_get(again, 0, &back));
+        CHECK_EQ(std::string(back.name), "Spam rule");
+        CHECK_EQ(std::string(back.conjunction), "or");
+        CHECK_EQ(std::string(back.value2), "lottery");
+        CHECK(back.manual == 1);
+        eudora_filters_free(again);
+    }
+
+    // The edited filter actually fires.
+    const std::string msg =
+        "From x@y.z Wed Jun 14 12:36:18 1989\r"
+        "Subject: get viagra here\r\r body\r";
+    int32_t count = 0;
+    eudora_fired_action *fired = eudora_filters_run(
+        f, EUDORA_FILTER_INCOMING, msg.data(), msg.size(), &count);
+    CHECK_EQ(count, 2);
+    eudora_fired_actions_free(fired, count);
+
+    // move/remove bookkeeping
+    const int32_t j = eudora_filters_add(f, "Second");
+    CHECK(eudora_filters_move(f, j, 0));
+    eudora_filter_info first{};
+    CHECK(eudora_filters_get(f, 0, &first));
+    CHECK_EQ(std::string(first.name), "Second");
+    CHECK(eudora_filters_remove(f, 0));
+    CHECK_EQ(eudora_filters_count(f), 1);
+    eudora_filters_free(f);
+}
+
 TEST_CASE("C API: version and errors") {
     CHECK_EQ(std::string(eudora_core_version()), "0.1.0");
     CHECK(eudora_mailbox_open("/nonexistent/path/Box") == nullptr);

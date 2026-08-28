@@ -82,6 +82,14 @@ char *eudora_mailbox_read_message(const eudora_mailbox *mb, int32_t index);
 
 /* Set state / mark for later persistence. */
 int eudora_mailbox_set_state(eudora_mailbox *mb, int32_t index, uint8_t state);
+/* Set the label color index (0-15; bits 14-17 of flags). */
+int eudora_mailbox_set_label(eudora_mailbox *mb, int32_t index, int label);
+/* Append a complete RFC 822 message (any line-end convention) to the mbox
+ * with a proper sendmail envelope, add its summary (state 0 keeps the
+ * scanner's verdict), and return the new index, or -1.  Call
+ * eudora_mailbox_save to persist the TOC. */
+int32_t eudora_mailbox_append_message(eudora_mailbox *mb, const char *raw,
+                                      size_t len, uint8_t state);
 /* Remove the message's summary (the bytes remain until compaction). */
 int eudora_mailbox_delete(eudora_mailbox *mb, int32_t index);
 /* Rewrite the mbox dropping unreferenced bytes and save the TOC. */
@@ -218,9 +226,44 @@ enum {
 
 eudora_filters *eudora_filters_load(const char *path);
 eudora_filters *eudora_filters_parse(const char *text);
+eudora_filters *eudora_filters_new(void);
 void eudora_filters_free(eudora_filters *f);
 int32_t eudora_filters_count(const eudora_filters *f);
 int eudora_filters_save(const eudora_filters *f, const char *path);
+
+/* One filter record, for the editor UI.  Strings returned by _get are owned
+ * by the set and valid until it is mutated or freed.  verb strings use the
+ * on-disk forms ("contains", "!is", "regex", ...); conjunction is one of
+ * "ignore", "and", "or", "unless". */
+typedef struct {
+    const char *name;
+    int32_t id;
+    int incoming, outgoing, manual;
+    const char *header1, *verb1, *value1;
+    const char *conjunction;
+    const char *header2, *verb2, *value2;
+} eudora_filter_info;
+
+int eudora_filters_get(const eudora_filters *f, int32_t index,
+                       eudora_filter_info *out);
+/* NULL string fields keep their current values. */
+int eudora_filters_set(eudora_filters *f, int32_t index,
+                       const eudora_filter_info *in);
+/* Appends a blank incoming filter; returns its index. */
+int32_t eudora_filters_add(eudora_filters *f, const char *name);
+int eudora_filters_remove(eudora_filters *f, int32_t index);
+int eudora_filters_move(eudora_filters *f, int32_t from, int32_t to);
+
+int32_t eudora_filter_action_count(const eudora_filters *f, int32_t index);
+int eudora_filter_action_get(const eudora_filters *f, int32_t index,
+                             int32_t action, const char **keyword,
+                             const char **value);
+int eudora_filter_action_add(eudora_filters *f, int32_t index,
+                             const char *keyword, const char *value);
+int eudora_filter_action_set(eudora_filters *f, int32_t index, int32_t action,
+                             const char *keyword, const char *value);
+int eudora_filter_action_remove(eudora_filters *f, int32_t index,
+                                int32_t action);
 
 /* Evaluate against a raw message; returns a malloc'd array of fired actions
  * (in execution order) and sets *out_count.  Free with
