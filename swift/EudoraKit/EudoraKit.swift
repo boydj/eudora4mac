@@ -418,6 +418,22 @@ public final class AddressBook {
         eudora_addressbook_remove(handle, name) == 1
     }
 
+    /// Whether a nickname expands to more than one address (a group).
+    public func isGroup(at index: Int) -> Bool {
+        guard let a = eudora_addressbook_addresses(handle, Int32(index))
+        else { return false }
+        return String(cString: a).contains(",")
+    }
+
+    /// Imports contacts from a delimited text (one per line: "Name <addr>",
+    /// "name<TAB>addr", "name,addr", or a bare "addr") and merges them in;
+    /// returns the number merged.  Existing nicknames are kept unless
+    /// `overwrite` is true.
+    @discardableResult
+    public func importContacts(_ text: String, overwrite: Bool = false) -> Int {
+        Int(eudora_addressbook_import_contacts(handle, text, overwrite ? 1 : 0))
+    }
+
     /// Recursively expands nicknames into bare addresses.
     public func expand(_ addressList: String) -> [String] {
         takeStringArray(eudora_addressbook_expand(handle, addressList))

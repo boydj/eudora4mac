@@ -102,7 +102,14 @@ What it recreates, and from where:
   (From / To / Subject / Cc / Bcc / Attached) over the body, the icon
   bar's priority popup, signature appending after the classic `-- `
   separator, and the two classic verbs: **Queue** (into Out as QUEUED)
-  and **Send** (SMTP now, copy kept in Out as SENT).
+  and **Send** (SMTP now, copy kept in Out as SENT).  The body is an
+  NSTextView-backed editor with the system **spell/grammar checker**;
+  a **Styled** toggle turns on rich text (Bold ⌘B / Italic ⌘I /
+  Underline ⌘U / Fonts), sent as a `multipart/alternative` with the
+  plain body first (the classic styled-text composer).  Recipient fields
+  **autocomplete** from the Address Book, and **Stationery** (message
+  templates in the "Stationery Folder") can be applied or saved from the
+  icon bar.
 - **Attachments** — the preview pane lists a message's MIME attachment
   parts (via the new `mail/mime_walker`) with click-to-save decoding;
   multipart bodies display their first text part instead of raw
@@ -125,7 +132,9 @@ What it recreates, and from where:
   (re-homing a stored message to a personality) stays inert — it has no
   modern analogue.
 - **The Address Book window** — nicknames, addresses, notes, expansion
-  preview, saved to the real "Eudora Nicknames" file.
+  preview, saved to the real "Eudora Nicknames" file.  Groups (multi-
+  address nicknames) are flagged in the list and expand recursively;
+  **Import…** merges contacts from a text, CSV, or tab-delimited file.
 - **Settings** — the classic panel-list dialog: Getting Started,
   Personalities (POP3 **and IMAP** accounts, include-in-checks,
   signature choice), Checking Mail (auto-check every N minutes,

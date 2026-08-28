@@ -5,6 +5,7 @@
 
 import EudoraKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct AddressBookView: View {
     @EnvironmentObject var model: AppModel
@@ -17,6 +18,7 @@ struct AddressBookView: View {
     @State private var newNamePrompt = false
     @State private var newName = ""
     @State private var dirty = false
+    @State private var showImporter = false
 
     var body: some View {
         HSplitView {
@@ -29,11 +31,19 @@ struct AddressBookView: View {
         .onAppear(perform: load)
         .onChange(of: selection) { _ in loadSelection() }
         .toolbar {
-            ToolbarItem {
+            ToolbarItemGroup {
+                Button("Import…") { showImporter = true }
+                    .help("Import contacts from a text, CSV, or tab-delimited file")
                 Button("Save") { save() }
                     .disabled(!dirty)
                     .keyboardShortcut("s", modifiers: [.command])
             }
+        }
+        .fileImporter(isPresented: $showImporter,
+                      allowedContentTypes: [.plainText, .commaSeparatedText,
+                                            .text, .data],
+                      allowsMultipleSelection: false) { result in
+            importContacts(result)
         }
         .navigationTitle("Address Book")
         .alert("New Nickname", isPresented: $newNamePrompt) {
@@ -54,7 +64,14 @@ struct AddressBookView: View {
         VStack(spacing: 0) {
             List(selection: $selection) {
                 ForEach(entries, id: \.name) { entry in
-                    Text(entry.name).tag(entry.name)
+                    Label {
+                        Text(entry.name)
+                    } icon: {
+                        Image(systemName: entry.addresses.contains(",")
+                            ? "person.2" : "person")
+                            .foregroundStyle(.secondary)
+                    }
+                    .tag(entry.name)
                 }
             }
             Divider()
@@ -123,6 +140,28 @@ struct AddressBookView: View {
 
     private func quotedName(_ name: String) -> String {
         name.contains(" ") ? "\"\(name)\"" : name
+    }
+
+    private func importContacts(_ result: Result<[URL], Error>) {
+        guard case let .success(urls) = result, let url = urls.first,
+              let book else { return }
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url) else {
+            model.statusText = "Cannot read \(url.lastPathComponent)."
+            return
+        }
+        // Contact exports are usually UTF-8; fall back to Latin-1 so no byte
+        // is rejected.
+        let text = String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .isoLatin1) ?? ""
+        let added = book.importContacts(text, overwrite: false)
+        commitEdits()
+        reload()
+        dirty = true
+        model.statusText = added == 0
+            ? "No new contacts imported."
+            : "Imported \(added) contact\(added == 1 ? "" : "s")."
     }
 
     private func load() {

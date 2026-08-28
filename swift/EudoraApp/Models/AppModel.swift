@@ -946,12 +946,36 @@ final class AppModel: ObservableObject {
 
     /// Stationery lives in the classic "Stationery Folder"; returns its text
     /// if a file of that name exists, else nil.
-    private func stationeryText(named name: String) -> String? {
+    func stationeryText(named name: String) -> String? {
         guard !name.isEmpty else { return nil }
-        let url = mailFolder.appendingPathComponent("Stationery Folder",
-                                                    isDirectory: true)
-            .appendingPathComponent(name)
+        let url = stationeryFolderURL.appendingPathComponent(name)
         return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    var stationeryFolderURL: URL {
+        mailFolder.appendingPathComponent("Stationery Folder", isDirectory: true)
+    }
+
+    /// Saved stationery (message templates) by name.
+    func stationeryNames() -> [String] {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: stationeryFolderURL,
+                                withIntermediateDirectories: true)
+        let names = (try? fm.contentsOfDirectory(atPath: stationeryFolderURL.path))
+            ?? []
+        return names.filter { !$0.hasPrefix(".") }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    func saveStationery(named name: String, text: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: stationeryFolderURL,
+                                withIntermediateDirectories: true)
+        try? text.write(to: stationeryFolderURL.appendingPathComponent(trimmed),
+                        atomically: true, encoding: .utf8)
+        statusText = "Saved stationery \"\(trimmed)\"."
     }
 
     /// Build an outgoing message from a compose seed (the non-UI counterpart
