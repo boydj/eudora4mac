@@ -45,7 +45,8 @@ struct EudoraApp: App {
         // Value-based groups: each action opens a fresh window whose @State
         // initializes from the value (a single Window scene cannot do this).
         WindowGroup("Composition", id: "compose", for: ComposeSeed.self) { $seed in
-            ComposeView(seed: seed ?? ComposeSeed())
+            // With defaultValue: provided, the binding is non-optional.
+            ComposeView(seed: seed)
                 .environmentObject(model)
         } defaultValue: {
             ComposeSeed()

@@ -24,7 +24,7 @@ jobs:
     name: Core (Linux, cmake + ctest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         run: cmake -B build -S core -DCMAKE_BUILD_TYPE=Release
       - name: Build
@@ -36,7 +36,7 @@ jobs:
     name: Core (macOS, cmake + ctest)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         # The CMake defaults the deployment target to 26.0 only when
         # unset; pin the runner SDK's floor (matches Package.swift).
@@ -52,7 +52,7 @@ jobs:
     name: App (macOS, swift build + package)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Swift version
         run: swift --version
       - name: Build (debug)

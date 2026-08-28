@@ -16,7 +16,7 @@ jobs:
     name: Build and release Eudora.app
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build (release)
         run: swift build -c release
       - name: Package Eudora.app

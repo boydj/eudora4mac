@@ -22,14 +22,11 @@ import Foundation
 import SwiftUI
 
 // Tolerant decode: a missing key, explicit null, or wrong type falls back
-// to the default instead of failing the whole settings file.
+// to the default instead of failing the whole settings file.  (try? of an
+// Optional-returning call flattens, so one ?? covers both cases.)
 private extension KeyedDecodingContainer {
     func value<T: Decodable>(_ key: Key, default def: T) -> T {
-        if let outer = try? decodeIfPresent(T.self, forKey: key),
-           let v = outer {
-            return v
-        }
-        return def
+        (try? decodeIfPresent(T.self, forKey: key)) ?? def
     }
 }
 
