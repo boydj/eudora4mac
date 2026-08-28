@@ -6,10 +6,24 @@
 
 #if os(macOS)
 
+import AppKit
 import SwiftUI
+
+// When launched as a bare executable (swift run) there is no app bundle,
+// and macOS treats the process as a background accessory: windows but no
+// menu bar or Dock icon.  Promote it to a regular foreground app so the
+// menu bar (App menu with Settings…, Message, Special) appears.  A bundled
+// Xcode build gets this for free; the calls are harmless there.
+final class EudoraAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
 
 @main
 struct EudoraApp: App {
+    @NSApplicationDelegateAdaptor(EudoraAppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
 
     var body: some Scene {
