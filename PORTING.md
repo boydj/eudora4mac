@@ -1,0 +1,136 @@
+# Porting Eudora 6.2.4 to Apple Silicon
+
+This repository contains the original QUALCOMM / Computer History Museum
+source of **Eudora 6.2.4 for Mac** (Carbon, PowerPC, CodeWarrior) plus a
+new, modern extraction of its core business logic in [`core/`](core/):
+**EudoraCore**, a C++20 static library that builds for
+`arm64-apple-macos` (and any POSIX host) with CMake.
+
+The legacy tree is left byte-for-byte untouched as reference. Nothing in
+`core/` includes a legacy header; every module is a translation, with the
+original file/line provenance noted in its header comments.
+
+## Building
+
+```sh
+cmake -B build -S core        # on macOS: configures arm64 / macOS 26 by default
+cmake --build build
+ctest --test-dir build        # 6 suites, all platform-independent
+```
+
+- **macOS**: `CMAKE_OSX_ARCHITECTURES=arm64` and
+  `CMAKE_OSX_DEPLOYMENT_TARGET=26.0` are set automatically (override with
+  the usual cache variables). Product: `libeudora_core.a` +
+  `core/include/eudora/`.
+- **TLS**: `find_package(OpenSSL)`; without OpenSSL the library builds with
+  the TLS transport disabled (`EUDORA_HAVE_TLS` unset). On macOS, install
+  via Homebrew (`brew install openssl@3`) or configure with
+  `-DEUDORA_ENABLE_TLS=OFF`.
+- **Linux**: the same tree builds and the full test suite runs; that is how
+  the port is verified in CI-like environments.
+
+## Attaching a SwiftUI frontend
+
+`core/include/eudora/eudora_core.h` is a flat `extern "C"` interface
+designed for a Swift bridging header / module map:
+
+- mailboxes: `eudora_mailbox_open` (reads or rebuilds the `.toc`),
+  summaries, raw message reads, state changes, delete + compact, save
+- message parsing: RFC 822 headers (RFC 2047-decoded), MIME facts,
+  base64/quoted-printable body decoding, address lists
+- `eudora_pop3_fetch`: one call: connect (TLS optional), authenticate
+  (SASL/APOP/USER-PASS), download into an mbox with proper envelopes,
+  update the `.toc`
+- `eudora_smtp_send`: one call: EHLO, STARTTLS, AUTH, envelope, DATA with
+  dot stuffing
+- filters: load/parse/save the classic "Eudora Filters" file and evaluate
+  messages, returning fired actions in the engine's execution order
+
+C++ consumers use `#include <eudora/core.hpp>`.
+
+## What was ported (and from where)
+
+| Modern module | Legacy source | Notes |
+|---|---|---|
+| `compat/endian.hpp` | — | explicit big-endian codecs; the legacy tree had **zero** byte-swapping (never ran little-endian) |
+| `compat/pstring`, `compat/macroman` | Pascal-string idioms, MacRoman | text is UTF-8 internally; Pascal/MacRoman only at the serialization boundary |
+| `compat/macdate` | `DateToSeconds`, `ZoneSecs`, `TZName2Offset`, `CStr2Zone` | timestamps stay Mac-epoch (1904) in the file format; Unix epoch at the API |
+| `compat/hashes` | `HashWithSeedLo`/`MIDHash` (message.c:4551) | bit-identical, so stored `msgIdHash`/`uidHash` stay valid |
+| `mailstore/toc_format` | `TOCType`/`MSumType` (Include/mailbox.h), `toc.c` | see **TOC binary format** below |
+| `mailstore/toc_io` | `ReadDForkTOC`/`WriteTOC` (toc.c) | data-fork sidecar only; resource-fork TOCs can't exist on modern filesystems |
+| `mailstore/line_reader` | `lineio.c` | accepts CR/LF/CRLF with byte-accurate offsets (legacy was CR-only) |
+| `mailstore/mbox_parser` | `buildtoc.c` (`BuildTOC`/`ReadSum`/`IsFromLine`/`BeautifyDate`/`BeautifyFrom`/`BeautifySubj`/`GleanFrom`/`UnixDate2Secs`) | includes the composition-order out-message heuristic, bulk detection, body-format sniffing, RFC 2047 decoding of From/Subject |
+| `mailstore/table_of_contents` | `SaveMessageSum`/`DeleteSum`/`FindSumByHash` (mailbox.c), `GetTOCK`/`FindTOCSpot` | |
+| `mailstore/compaction` | `squish.c` (`NeedsCompaction`/`CompactMailbox`) | note: legacy `compact.c` was the *composition window*, not compaction |
+| `mail/mime_codec` | `Encode64`/`Decode64`/`EncodeQP`/`DecodeQP` (mime.c:106-478) | streaming state machines incl. text-mode newline fixes and SMTP transparency |
+| `mail/rfc2047` | `Fix1342`/`Translate1342`/`PseudoQP` (lex822.c) | decodes to UTF-8 (legacy went to MacRoman); unknown charsets left intact |
+| `mail/lex822` | `lex822.c` token classes | tokenizes in-memory field bodies (legacy read from TransStream) |
+| `mail/header_parser` | `header.c` (`ReadHeader`/`HeaderDesc`) | unfolding, MIME type/params/boundary/filename, transfer encoding |
+| `mail/address_parser` | `SuckPtrAddresses` (address.c:84) | verbatim state-table port; group syntax yields `name:`/`;` marker tokens exactly as the original did |
+| `net/transport` | `TransVector` (mydefs.h:369) | abstract class; `flush_input` fixes the pop.c:532 `OTFlushInput` vtable leak; cancellation is a per-connection atomic instead of the thread-local `CommandPeriod` |
+| `net/posix_transport` | `tcp.c` (2,638 lines of Open Transport) | getaddrinfo + poll-sliced blocking sockets; no event loop inside reads |
+| `net/line_receiver` | `NetRecvLine` (ph.c:3055) | incl. the `TREAT_BODY_CR_AS_CRLF` Exchange workaround |
+| `net/tls_transport` | `ssl.c` + `OpenSSL.cp` | same decorator/custom-BIO architecture, direct OpenSSL link; per-stream state (legacy had one global `ESSLSubTrans` slot) |
+| `protocols/pop3` | `pop.c` protocol half | greeting/CAPA/STLS, auth ladder, STAT/LIST/UIDL/LAST/TOP/RETR/DELE, `ReadPOPLine` dot-unstuffing + `>From ` escaping |
+| `protocols/smtp` | `sendmail.c` protocol half | EHLO parsing (incl. `AUTH=` quirk), HELO fallback, `GetReplyLo` multiline reader, 452→552 and rcpt-5xx→550 fixups, DATA dot stuffing |
+| `protocols/sasl` | `sasl.c` | CRAM-MD5 / PLAIN / LOGIN + APOP digest |
+| `protocols/md5` | `md5.c` | RFC 1321/2104 |
+| `filters/filter_file` | `filtmng.c` + `FiltDefs` string tables | text format round-trips; `copyInstead` and `raise`/`lower` migrations preserved |
+| `filters/match_engine` | `filtrun.c` match cascade | all 15 verbs, LWSP-insensitive matching, junk meta-term, `FAPass` execution ordering, stop actions |
+| `filters/regexp` | `regexp.c` (Spencer V8 adaptation) | POSIX extended regex (same Spencer lineage) behind the `SearchRegExpPtr` interface |
+
+## The `.toc` binary format (decoded in `mailstore/toc_format.*`)
+
+A `.toc` file is a raw memory image of the legacy in-memory Handle:
+a **278-byte header** (`TOCType` through `sums`) followed by one
+**220-byte record per message** (`MSumType`), all **big-endian**, laid out
+with **mac68k (2-byte) struct alignment**, **CodeWarrior MSB-first
+bitfields**, and smallest-fit enums (`StateEnum` is one byte). There is no
+magic number; validity is the size invariant
+`file == 278 + max(1, count) × 220` plus per-record range checks
+(`InsaneTOC`). Live pointers the original serialized as garbage (`refN`,
+`messH`, `cache`, `win`, `next`, …) are skipped on read and zeroed on
+write, exactly as `ReadTOC` reset them on load. `boxSize` stores the
+mailbox size **plus one** ("add 1 to signal that we know it's ok",
+toc.c:426). The embedded `FSSpec` is machine-local; like the original,
+the loader re-stamps the mailbox location from the file's actual path.
+
+Note: the shipping **Carbon (CFM)** build's layout is implemented. The
+unfinished Mach-O target in `Eudora.proj.xml` used PowerPC natural
+alignment and would have produced *different* file offsets; it never
+shipped, so `.toc` files in the wild are the mac68k layout.
+
+## Deliberately not ported (this pass)
+
+- **All Carbon UI** — windows, dialogs, menus, PETE editor, toolbar,
+  drawers (`boxact.c`, `compact.c`, `filtwin.c`, `mywindow.c`, …). The
+  clean C/Swift API in `core/include/eudora/` is the attachment point for
+  a new SwiftUI frontend.
+- **IMAP** — the UW c-client (`CrispinIMAP/`) is the cleanest large body
+  in the legacy tree and plugs into the same transport seam via its
+  `net_*` glue (~200 lines in `CrispinIMAP/mail.c`); it is the natural
+  next phase, along with `imapdownload.c`'s sync engine.
+- **Dead code**: the abandoned "MIME Store" rewrite
+  (`mstore.c`/`mstoc.c`/`msmaildb.c`/`msiddb.c`/`msinfo.c` — never called
+  from live code), `ctb.c`/`dial.c` (compiled out since before 6.2.4),
+  `sslCerts.cp` (behind `#if 0`), and every CFM/Mach-O bridge
+  (`MachOWrapper.*`, `wrappers.cp`, the `CreateSSLBundle` symlink hack).
+- Address book / nicknames, preferences, junk scoring (the Bayes plugin
+  API), attachment en/decoding beyond the transfer codecs
+  (BinHex/AppleDouble/AppleSingle, PICT/QuickTime), printing, speech,
+  LDAP/Ph, Palm conduits, the ad/registration subsystems.
+
+## Known behavioral deviations
+
+- Text at the API is UTF-8; legacy TOC records written by real Eudora
+  store MacRoman unless `FLAG_UTF8` is set — both are decoded correctly,
+  and records are written back with the same convention.
+- Nickname ("intersects") terms match against literal address lists;
+  nickname *expansion* requires the address book, exposed as a hook.
+- Filter "date" terms match a modern short date string rather than the
+  resource-driven localized date formats.
+- RFC 2047 decoding covers utf-8, iso-8859-1, windows-1252, us-ascii and
+  macintosh; other charsets are left encoded (the original punted to its
+  resource translation tables in the same situation).
+- POP3 command pipelining (the `POPCmds` stack) is not implemented;
+  commands run sequentially.
