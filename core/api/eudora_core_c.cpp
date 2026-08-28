@@ -1,0 +1,1994 @@
+// Implementation of the C bridging interface (eudora/eudora_core.h).
+
+#include "eudora/eudora_core.h"
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <exception>
+#include <limits>
+#include <map>
+#include <set>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#ifndef _WIN32
+#include <unistd.h> // fsync, fileno
+#endif
+
+#include "addressbook/nicknames.hpp"
+#include "compat/hashes.hpp"
+#include "compat/macdate.hpp"
+#include "filters/filter_file.hpp"
+#include "filters/match_engine.hpp"
+#include "mail/address_parser.hpp"
+#include "mail/composer.hpp"
+#include "mail/header_parser.hpp"
+#include "mail/mime_codec.hpp"
+#include "mail/mime_walker.hpp"
+#include "mailstore/compaction.hpp"
+#include "mailstore/mbox_parser.hpp"
+#include "mailstore/toc_io.hpp"
+#include "net/posix_transport.hpp"
+#if defined(EUDORA_HAVE_TLS)
+#include "net/tls_transport.hpp"
+#elif defined(__APPLE__)
+#include "net/apple_tls_transport.hpp"
+#endif
+#include "protocols/imap.hpp"
+#include "protocols/pop3.hpp"
+#include "protocols/smtp.hpp"
+
+using namespace eudora;
+
+namespace {
+
+thread_local std::string g_last_error;
+
+void set_error(std::string msg) { g_last_error = std::move(msg); }
+
+// Runs fn(), turning any C++ exception into an error string plus a
+// value-initialized fallback (nullptr / 0 / false) so a bad_alloc,
+// length_error, or filesystem_error on hostile input can never cross the C
+// boundary as std::terminate.  Wraps the entry points that parse untrusted
+// data, allocate from attacker-controlled sizes, or touch the filesystem.
+template <typename Fn>
+auto guard(const char *ctx, Fn &&fn) -> decltype(fn()) {
+    using R = decltype(fn());
+    try {
+        return fn();
+    } catch (const std::exception &e) {
+        set_error(std::string(ctx) + ": " + e.what());
+    } catch (...) {
+        set_error(std::string(ctx) + ": unknown error");
+    }
+    return R();
+}
+
+// A CR or LF in a value that gets concatenated into a protocol command
+// (a From address, a login credential, an IMAP mailbox name) is a
+// command-injection vector.  Reject rather than silently strip so the
+// caller sees the bad input.
+bool has_control_break(const char *s) {
+    if (!s)
+        return false;
+    for (; *s; ++s)
+        if (*s == '\r' || *s == '\n')
+            return true;
+    return false;
+}
+
+char *dup_string(std::string_view s) {
+    char *out = static_cast<char *>(std::malloc(s.size() + 1));
+    if (!out)
+        return nullptr;
+    std::memcpy(out, s.data(), s.size());
+    out[s.size()] = '\0';
+    return out;
+}
+
+std::string read_file_range(const std::filesystem::path &path,
+                            std::int64_t offset, std::int64_t length) {
+    std::string out;
+    std::FILE *f = std::fopen(path.string().c_str(), "rb");
+    if (!f)
+        return out;
+    if (std::fseek(f, static_cast<long>(offset), SEEK_SET) == 0 && length > 0) {
+        out.resize(static_cast<std::size_t>(length));
+        const std::size_t got = std::fread(out.data(), 1, out.size(), f);
+        out.resize(got);
+    }
+    std::fclose(f);
+    return out;
+}
+
+} // namespace
+
+struct eudora_mailbox {
+    TableOfContents toc;
+    std::filesystem::path toc_file;
+    // Stable storage for strings returned by eudora_mailbox_summary.  The
+    // summary's from/subject live in toc.sums, a vector that moves its
+    // elements on append/delete; returning c_str() into it would dangle
+    // after the very mutations the header says are safe.  A deque never
+    // invalidates references to existing elements, so copies stashed here
+    // stay valid for the handle's whole life, honoring the contract.
+    // mutable: it is a read cache filled by the const summary accessor.
+    mutable std::deque<std::string> str_pool;
+
+    const char *stash(const std::string &s) const {
+        str_pool.push_back(s);
+        return str_pool.back().c_str();
+    }
+};
+
+struct eudora_message {
+    std::string raw;
+    std::string body;
+    HeaderSet headers;
+    std::string boundary;
+    std::string filename;
+    std::vector<MimePart> parts; // leaf parts; offsets index into raw
+    // per-handle stable storage for returned decoded headers is malloc'd
+};
+
+struct eudora_filters {
+    std::vector<Filter> filters;
+};
+
+struct eudora_addressbook {
+    AddressBook book;
+};
+
+extern "C" {
+
+const char *eudora_core_version(void) { return "0.1.0"; }
+
+const char *eudora_last_error(void) { return g_last_error.c_str(); }
+
+void eudora_string_free(char *s) { std::free(s); }
+
+/* ---- mailboxes -------------------------------------------------------- */
+
+eudora_mailbox *eudora_mailbox_open(const char *mbox_path) {
+    if (!mbox_path) {
+        set_error("mbox_path is null");
+        return nullptr;
+    }
+    // Parsing a hostile .toc / mbox can throw (bad_alloc, length_error);
+    // keep it off the C boundary.
+    return guard("open mailbox", [&]() -> eudora_mailbox * {
+        const std::filesystem::path box(mbox_path);
+        std::error_code ec;
+        if (!std::filesystem::exists(box, ec)) {
+            set_error("mailbox not found: " + box.string());
+            return nullptr;
+        }
+
+        auto mb = std::make_unique<eudora_mailbox>();
+        mb->toc_file = toc_path_for_mailbox(box);
+
+        // CheckTOC semantics: use the .toc when valid, else rebuild.
+        tocfmt::TocError terr = tocfmt::TocError::None;
+        if (auto toc = read_toc(mb->toc_file, box, &terr)) {
+            mb->toc = std::move(*toc);
+        } else {
+            auto built = build_toc(box);
+            if (!built) {
+                set_error("cannot scan mailbox: " + box.string());
+                return nullptr;
+            }
+            mb->toc = std::move(*built);
+            write_toc(mb->toc, mb->toc_file);
+        }
+        return mb.release();
+    });
+}
+
+void eudora_mailbox_close(eudora_mailbox *mb) { delete mb; }
+
+int32_t eudora_mailbox_count(const eudora_mailbox *mb) {
+    return mb ? mb->toc.count() : 0;
+}
+
+int eudora_mailbox_summary(const eudora_mailbox *mb, int32_t index,
+                           eudora_summary *out) {
+    if (!mb || !out || index < 0 || index >= mb->toc.count()) {
+        set_error("summary index out of range");
+        return 0;
+    }
+    const MessageSummary &s = mb->toc.sums[static_cast<std::size_t>(index)];
+    out->index = index;
+    out->offset = s.offset;
+    out->length = s.length;
+    out->body_offset = s.body_offset;
+    out->serial_num = s.serial_num;
+    out->date_unix = mac_to_unix(s.seconds);
+    out->orig_zone_minutes = s.orig_zone;
+    out->flags = s.flags;
+    out->opts = s.opts;
+    out->state = static_cast<uint8_t>(s.state);
+    out->spam_score = s.spam_score;
+    out->priority_display = static_cast<uint8_t>(s.display_priority());
+    out->uid_hash = s.uid_hash;
+    out->msg_id_hash = s.msg_id_hash;
+    out->from = mb->stash(s.from);
+    out->subject = mb->stash(s.subject);
+    out->arrival_unix = mac_to_unix(s.arrival_seconds);
+    return 1;
+}
+
+char *eudora_mailbox_read_message(const eudora_mailbox *mb, int32_t index) {
+    if (!mb || index < 0 || index >= mb->toc.count()) {
+        set_error("message index out of range");
+        return nullptr;
+    }
+    const MessageSummary &s = mb->toc.sums[static_cast<std::size_t>(index)];
+    if (s.offset < 0) {
+        set_error("message not downloaded (IMAP placeholder)");
+        return nullptr;
+    }
+    // A corrupt length can drive a huge allocation; guard the read.
+    return guard("read message", [&]() -> char * {
+        const std::string text =
+            read_file_range(mb->toc.mailbox_path, s.offset, s.length);
+        if (text.empty() && s.length > 0) {
+            set_error("cannot read mailbox file");
+            return nullptr;
+        }
+        return dup_string(text);
+    });
+}
+
+int eudora_mailbox_set_state(eudora_mailbox *mb, int32_t index, uint8_t state) {
+    if (!mb || index < 0 || index >= mb->toc.count())
+        return 0;
+    mb->toc.sums[static_cast<std::size_t>(index)].state =
+        static_cast<MessageState>(state);
+    return 1;
+}
+
+int eudora_mailbox_set_label(eudora_mailbox *mb, int32_t index, int label) {
+    if (!mb || index < 0 || index >= mb->toc.count() || label < 0 || label > 15)
+        return 0;
+    auto &flags = mb->toc.sums[static_cast<std::size_t>(index)].flags;
+    flags = (flags & ~(0xFu << 14)) |
+            (static_cast<std::uint32_t>(label) << 14);
+    return 1;
+}
+
+int eudora_mailbox_set_priority(eudora_mailbox *mb, int32_t index,
+                                int display_priority) {
+    if (!mb || index < 0 || index >= mb->toc.count() ||
+        display_priority < 1 || display_priority > 5) {
+        set_error("bad priority or index");
+        return 0;
+    }
+    mb->toc.sums[static_cast<std::size_t>(index)].priority =
+        display_to_priority(display_priority);
+    return 1;
+}
+
+int eudora_mailbox_set_spam_score(eudora_mailbox *mb, int32_t index,
+                                  int score) {
+    if (!mb || index < 0 || index >= mb->toc.count()) {
+        set_error("summary index out of range");
+        return 0;
+    }
+    const int clamped = score < -128 ? -128 : (score > 127 ? 127 : score);
+    mb->toc.sums[static_cast<std::size_t>(index)].spam_score =
+        static_cast<std::int8_t>(clamped);
+    return 1;
+}
+
+int eudora_mailbox_set_subject(eudora_mailbox *mb, int32_t index,
+                               const char *subject) {
+    if (!mb || !subject || index < 0 || index >= mb->toc.count()) {
+        set_error("bad subject or index");
+        return 0;
+    }
+    mb->toc.sums[static_cast<std::size_t>(index)].subject = subject;
+    return 1;
+}
+
+int32_t eudora_mailbox_find_by_serial(const eudora_mailbox *mb,
+                                      int32_t serial_num) {
+    return mb ? mb->toc.find_by_serial(serial_num) : -1;
+}
+
+int eudora_mailbox_delete(eudora_mailbox *mb, int32_t index) {
+    if (!mb)
+        return 0;
+    return mb->toc.remove(index) ? 1 : 0;
+}
+
+int eudora_mailbox_compact(eudora_mailbox *mb) {
+    if (!mb)
+        return 0;
+    if (!compact_mailbox(mb->toc)) {
+        set_error("compaction failed");
+        return 0;
+    }
+    return write_toc(mb->toc, mb->toc_file) ? 1 : 0;
+}
+
+int eudora_mailbox_save(eudora_mailbox *mb) {
+    if (!mb)
+        return 0;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(mb->toc.mailbox_path, ec);
+    if (!ec)
+        mb->toc.recalc_kbytes(static_cast<std::int64_t>(size));
+    return write_toc(mb->toc, mb->toc_file) ? 1 : 0;
+}
+
+/* ---- message parsing --------------------------------------------------- */
+
+eudora_message *eudora_message_parse(const char *raw, size_t len) {
+    if (!raw) {
+        set_error("raw message is null");
+        return nullptr;
+    }
+    // Parsing untrusted message text can throw (bad_alloc on a hostile
+    // input); never let it cross the C boundary as std::terminate.
+    try {
+        auto msg = std::make_unique<eudora_message>();
+        msg->raw.assign(raw, len);
+        const auto parts = split_message(msg->raw);
+        msg->headers = HeaderSet::parse(parts.header_block);
+        msg->body.assign(parts.body);
+        msg->boundary = msg->headers.boundary();
+        msg->filename = msg->headers.filename();
+        msg->parts = walk_mime(msg->raw);
+        return msg.release();
+    } catch (const std::exception &e) {
+        set_error(std::string("parse failed: ") + e.what());
+        return nullptr;
+    } catch (...) {
+        set_error("parse failed");
+        return nullptr;
+    }
+}
+
+void eudora_message_free(eudora_message *msg) { delete msg; }
+
+char *eudora_message_header(const eudora_message *msg, const char *name) {
+    if (!msg || !name)
+        return nullptr;
+    if (auto v = msg->headers.get(name))
+        return dup_string(*v);
+    return nullptr;
+}
+
+char *eudora_message_header_decoded(const eudora_message *msg,
+                                    const char *name) {
+    if (!msg || !name)
+        return dup_string("");
+    return dup_string(msg->headers.get_decoded(name));
+}
+
+const char *eudora_message_body(const eudora_message *msg) {
+    return msg ? msg->body.c_str() : "";
+}
+
+const char *eudora_message_content_type(const eudora_message *msg) {
+    return msg ? msg->headers.content_type().c_str() : "";
+}
+
+const char *eudora_message_content_subtype(const eudora_message *msg) {
+    return msg ? msg->headers.content_subtype().c_str() : "";
+}
+
+const char *eudora_message_boundary(const eudora_message *msg) {
+    return msg ? msg->boundary.c_str() : "";
+}
+
+const char *eudora_message_filename(const eudora_message *msg) {
+    return msg ? msg->filename.c_str() : "";
+}
+
+int eudora_message_transfer_encoding(const eudora_message *msg) {
+    if (!msg)
+        return 0;
+    switch (msg->headers.transfer_encoding()) {
+    case TransferEncoding::QuotedPrintable: return 1;
+    case TransferEncoding::Base64: return 2;
+    case TransferEncoding::Other: return 3;
+    default: return 0;
+    }
+}
+
+/* ---- MIME parts -------------------------------------------------------- */
+
+extern "C++" {
+namespace {
+int encoding_code(TransferEncoding e) {
+    switch (e) {
+    case TransferEncoding::QuotedPrintable: return 1;
+    case TransferEncoding::Base64: return 2;
+    case TransferEncoding::Other: return 3;
+    default: return 0;
+    }
+}
+} // namespace
+} // extern "C++"
+
+int32_t eudora_message_part_count(const eudora_message *msg) {
+    return msg ? static_cast<int32_t>(msg->parts.size()) : 0;
+}
+
+int eudora_message_part_info(const eudora_message *msg, int32_t index,
+                             eudora_part_info *out) {
+    if (!msg || !out || index < 0 ||
+        index >= static_cast<int32_t>(msg->parts.size())) {
+        set_error("part index out of range");
+        return 0;
+    }
+    const MimePart &p = msg->parts[static_cast<std::size_t>(index)];
+    out->type = p.type.c_str();
+    out->subtype = p.subtype.c_str();
+    out->filename = p.filename.c_str();
+    out->transfer_encoding = encoding_code(p.encoding);
+    out->depth = p.depth;
+    out->is_attachment = p.is_attachment ? 1 : 0;
+    out->size = static_cast<int64_t>(p.body_length);
+    return 1;
+}
+
+char *eudora_message_part_decode(const eudora_message *msg, int32_t index,
+                                 size_t *out_len) {
+    if (!msg || index < 0 ||
+        index >= static_cast<int32_t>(msg->parts.size())) {
+        set_error("part index out of range");
+        return nullptr;
+    }
+    try {
+        const std::string decoded =
+            decode_part(msg->raw, msg->parts[static_cast<std::size_t>(index)]);
+        if (out_len)
+            *out_len = decoded.size();
+        return dup_string(decoded);
+    } catch (const std::exception &e) {
+        set_error(std::string("decode failed: ") + e.what());
+        return nullptr;
+    } catch (...) {
+        set_error("decode failed");
+        return nullptr;
+    }
+}
+
+char *eudora_message_part_text(const eudora_message *msg, int32_t index) {
+    if (!msg || index < 0 ||
+        index >= static_cast<int32_t>(msg->parts.size())) {
+        set_error("part index out of range");
+        return nullptr;
+    }
+    try {
+        return dup_string(decode_text_part(
+            msg->raw, msg->parts[static_cast<std::size_t>(index)]));
+    } catch (...) {
+        set_error("decode failed");
+        return nullptr;
+    }
+}
+
+char *eudora_decode_body(const char *data, size_t len, int encoding,
+                         size_t *out_len) {
+    if (!data || !out_len)
+        return nullptr;
+    return guard("decode body", [&]() -> char * {
+        std::string out;
+        const std::string_view in(data, len);
+        bool ok = true;
+        if (encoding == 1)
+            ok = qp_decode(in, out);
+        else if (encoding == 2)
+            ok = base64_decode(in, out);
+        else
+            out.assign(in);
+        if (!ok)
+            set_error("body had decoding errors");
+        char *buf = static_cast<char *>(std::malloc(out.size() + 1));
+        if (!buf)
+            return nullptr;
+        std::memcpy(buf, out.data(), out.size());
+        buf[out.size()] = '\0';
+        *out_len = out.size();
+        return buf;
+    });
+}
+
+char **eudora_parse_addresses(const char *header_value) {
+    if (!header_value)
+        return nullptr;
+    auto parsed = parse_addresses(header_value, false);
+    if (!parsed) {
+        set_error("malformed address list");
+        return nullptr;
+    }
+    char **arr = static_cast<char **>(
+        std::calloc(parsed->size() + 1, sizeof(char *)));
+    if (!arr)
+        return nullptr;
+    for (std::size_t i = 0; i < parsed->size(); ++i)
+        arr[i] = dup_string((*parsed)[i]);
+    return arr;
+}
+
+void eudora_addresses_free(char **addresses) {
+    if (!addresses)
+        return;
+    for (char **p = addresses; *p; ++p)
+        std::free(*p);
+    std::free(addresses);
+}
+
+/* ---- POP3 -------------------------------------------------------------- */
+
+extern "C++" {
+namespace {
+
+struct TransportBundle {
+    PosixTransport plain;
+#if defined(EUDORA_HAVE_TLS)
+    std::unique_ptr<TlsTransport> tls;
+#elif defined(__APPLE__)
+    std::unique_ptr<AppleTlsTransport> tls;
+#endif
+    Transport *active = nullptr;
+
+    // Returns nullptr and sets an error if the requested mode is impossible.
+    Transport *setup(int tls_mode) {
+#if defined(EUDORA_HAVE_TLS) || defined(__APPLE__)
+        if (tls_mode != EUDORA_TLS_NONE) {
+#if defined(EUDORA_HAVE_TLS)
+            tls = std::make_unique<TlsTransport>(plain);
+#else
+            tls = std::make_unique<AppleTlsTransport>(plain);
+#endif
+            active = tls.get();
+        } else {
+            active = &plain;
+        }
+        return active;
+#else
+        if (tls_mode != EUDORA_TLS_NONE) {
+            set_error("TLS not built into this EudoraCore");
+            return nullptr;
+        }
+        active = &plain;
+        return active;
+#endif
+    }
+
+    bool start_tls(const std::string &host) {
+#if defined(EUDORA_HAVE_TLS)
+        if (tls && tls->start_tls(host) == NetError::None)
+            return true;
+        set_error(tls ? "TLS handshake failed: " + tls->last_tls_error()
+                      : "TLS not configured");
+        return false;
+#elif defined(__APPLE__)
+        if (tls && tls->start_tls(host) == NetError::None)
+            return true;
+        set_error(tls ? tls->last_tls_error() : "TLS not configured");
+        return false;
+#else
+        (void)host;
+        set_error("TLS not built into this EudoraCore");
+        return false;
+#endif
+    }
+};
+
+// SumToFrom (buildtoc.c:1272): the envelope line for a stored message.
+std::string envelope_from_line(const HeaderSet &hs) {
+    std::string addr = "???@???";
+    if (auto from = hs.get("From")) {
+        const std::string s = short_address(*from);
+        if (!s.empty())
+            addr = s;
+    }
+    const DateTimeParts now =
+        mac_seconds_to_date(mac_now_utc() +
+                            static_cast<std::uint32_t>(local_zone_seconds()));
+    static const char *days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    // Day of week via the civil-days computation (Mac epoch was a Friday,
+    // but compute from Unix days: 1970-01-01 was a Thursday).
+    const std::int64_t unix_days =
+        (mac_to_unix(mac_now_utc()) + local_zone_seconds()) / 86400;
+    const int dow = static_cast<int>(((unix_days % 7) + 11) % 7); // 1970-01-01 = Thu(4)
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "From %s %s %s %2d %02d:%02d:%02d %d\r",
+                  addr.c_str(), days[dow], months[now.month - 1], now.day,
+                  now.hour, now.minute, now.second, now.year);
+    return buf;
+}
+
+} // namespace
+} // extern "C++"
+
+int32_t eudora_mailbox_append_message(eudora_mailbox *mb, const char *raw,
+                                      size_t len, uint8_t state) {
+    if (!mb || !raw) {
+        set_error("missing argument");
+        return -1;
+    }
+    // Normalize to the mailbox's CR line-end convention.
+    std::string message;
+    message.reserve(len);
+    for (std::size_t i = 0; i < len; ++i) {
+        const char c = raw[i];
+        if (c == '\r') {
+            message += '\r';
+            if (i + 1 < len && raw[i + 1] == '\n')
+                ++i;
+        } else if (c == '\n') {
+            message += '\r';
+        } else {
+            message += c;
+        }
+    }
+    if (message.empty() || message.back() != '\r')
+        message += '\r';
+
+    const auto parts = split_message(message);
+    const HeaderSet hs = HeaderSet::parse(parts.header_block);
+    const std::string envelope = envelope_from_line(hs);
+
+    std::FILE *out = std::fopen(mb->toc.mailbox_path.string().c_str(), "ab");
+    if (!out) {
+        set_error("cannot append to mailbox");
+        return -1;
+    }
+    std::fseek(out, 0, SEEK_END);
+    const std::int64_t start = std::ftell(out);
+    // TOC offsets and lengths are 32-bit (the classic 2 GB mailbox
+    // ceiling); refuse rather than silently truncate the index.
+    const std::int64_t total =
+        static_cast<std::int64_t>(envelope.size() + message.size());
+    if (start < 0 ||
+        start + total > std::numeric_limits<std::int32_t>::max()) {
+        std::fclose(out);
+        set_error("mailbox would exceed 2 GB");
+        return -1;
+    }
+    const bool ok =
+        std::fwrite(envelope.data(), 1, envelope.size(), out) == envelope.size() &&
+        std::fwrite(message.data(), 1, message.size(), out) == message.size();
+    if (ok) {
+        // Get the bytes to disk before the TOC records them, so a crash
+        // can't leave a TOC that points past real data.
+        std::fflush(out);
+#ifndef _WIN32
+        ::fsync(::fileno(out));
+#endif
+    }
+    std::fclose(out);
+    if (!ok) {
+        // Roll the partial write back to `start`: otherwise the mailbox
+        // grows but no summary covers the tail, and the boxSize check would
+        // later bless the garbage instead of triggering a rebuild.
+        std::error_code tec;
+        std::filesystem::resize_file(
+            mb->toc.mailbox_path, static_cast<std::uintmax_t>(start), tec);
+        set_error("cannot write to mailbox");
+        return -1;
+    }
+
+    LineReader reader;
+    MessageSummary sum;
+    if (!reader.open(mb->toc.mailbox_path) || !reader.seek(start)) {
+        set_error("cannot rescan mailbox");
+        return -1;
+    }
+    MboxScanner scanner(reader, MboxParseOptions{});
+    if (!scanner.next(sum)) {
+        set_error("appended message did not scan");
+        return -1;
+    }
+    if (state)
+        sum.state = static_cast<MessageState>(state);
+    mb->toc.append(std::move(sum));
+
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(mb->toc.mailbox_path, ec);
+    if (!ec)
+        mb->toc.recalc_kbytes(static_cast<std::int64_t>(size));
+    return mb->toc.count() - 1;
+}
+
+int32_t eudora_pop3_fetch_opts(const char *host, uint16_t port, int tls_mode,
+                               const char *user, const char *password,
+                               const char *mbox_path,
+                               const eudora_pop3_options *options,
+                               eudora_progress_fn progress, void *ctx) {
+    if (!host || !user || !password || !mbox_path) {
+        set_error("missing argument");
+        return -1;
+    }
+    if (has_control_break(user) || has_control_break(password)) {
+        set_error("credentials contain a line break");
+        return -1;
+    }
+    // Untrusted server data drives allocations below; keep any exception
+    // from crossing the C boundary (see the catch at the end).
+    try {
+    const eudora_pop3_options opts =
+        options ? *options : eudora_pop3_options{0, 0, 0, nullptr};
+    const int delete_from_server = opts.delete_from_server;
+
+    TransportBundle bundle;
+    Transport *transport = bundle.setup(tls_mode);
+    if (!transport)
+        return -1;
+    // A silent server must not hang Check Mail forever: the legacy engine
+    // bounded every read with the TIMEOUT setting; 60s matches its default
+    // ceiling.
+    bundle.plain.set_recv_timeout(60);
+
+    // Cancellation: a nonzero return from the callback trips the transport's
+    // cancel token, so an in-flight blocking read also bails out.
+    std::atomic<bool> cancel_flag{false};
+    bundle.plain.set_cancel_flag(&cancel_flag);
+    if (bundle.active && bundle.active != &bundle.plain)
+        bundle.active->set_cancel_flag(&cancel_flag);
+    const auto report = [&](const char *stage, long done, long total) {
+        if (cancel_flag.load(std::memory_order_relaxed))
+            return false;
+        if (progress && progress(ctx, stage, static_cast<int32_t>(done),
+                                 static_cast<int32_t>(total)) != 0) {
+            cancel_flag.store(true, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    };
+
+    Pop3Session pop(*transport);
+
+    if (!report("connect", 0, 0))
+        return 0;
+    if (transport->connect(host, port, 45) != NetError::None) {
+        set_error("cannot connect to " + std::string(host));
+        return -1;
+    }
+    if (tls_mode == EUDORA_TLS_IMMEDIATE && !bundle.start_tls(host))
+        return -1;
+    if (!pop.begin_connected()) {
+        set_error("no POP3 greeting");
+        return -1;
+    }
+    pop.query_capabilities();
+    if (tls_mode == EUDORA_TLS_STARTTLS) {
+        if (!pop.request_stls()) {
+            set_error("server refused STLS: " + pop.last_response());
+            return -1;
+        }
+        if (!bundle.start_tls(host)) {
+            // STLS was accepted but the handshake did not engage: drain the
+            // bogus reply Cyrus leaves behind before giving up.
+            pop.flush_after_failed_tls();
+            return -1;
+        }
+        pop.rescan_capabilities();
+    }
+    if (!report("auth", 0, 0))
+        return 0;
+    if (!pop.login(user, password)) {
+        set_error("authentication failed: " + pop.last_response());
+        return -1;
+    }
+
+    if (!report("list", 0, 0))
+        return 0;
+    long count = 0, total = 0;
+    if (!pop.stat(count, total)) {
+        set_error("STAT failed: " + pop.last_response());
+        return -1;
+    }
+
+    // Open (or create) the mailbox and its TOC.
+    const std::filesystem::path box(mbox_path);
+    {
+        std::FILE *touch = std::fopen(box.string().c_str(), "ab");
+        if (!touch) {
+            set_error("cannot open mailbox for append");
+            return -1;
+        }
+        std::fclose(touch);
+    }
+    std::unique_ptr<eudora_mailbox> mb(eudora_mailbox_open(mbox_path));
+    if (!mb)
+        return -1;
+
+    // UIDL dedup (FillWithUidl + MSumType.uidHash): a message whose unique-id
+    // hash already appears in a summary was fetched on an earlier check and
+    // left on the server — skip it.  Servers without UIDL fall back to
+    // fetching everything.
+    std::map<long, std::string> uids;
+    const bool have_uidl = count > 0 && pop.uidl(uids);
+
+    // Sizes are needed only for the big-message limit (FillSizesWithList).
+    std::map<long, long> sizes;
+    if (opts.max_message_k > 0)
+        pop.list(sizes);
+
+    // PREF_SERVER_DEL: hashes of messages the user emptied from Trash and
+    // wants gone from the server.  DELE any that are still up there.
+    std::set<std::uint32_t> server_delete;
+    if (opts.server_delete_list && *opts.server_delete_list && have_uidl) {
+        std::FILE *sd = std::fopen(opts.server_delete_list, "r");
+        if (sd) {
+            char line[64];
+            while (std::fgets(line, sizeof(line), sd))
+                if (const unsigned long v = std::strtoul(line, nullptr, 10))
+                    server_delete.insert(static_cast<std::uint32_t>(v));
+            std::fclose(sd);
+        }
+    }
+    std::set<std::uint32_t> server_delete_remaining = server_delete;
+
+    std::vector<std::pair<long, std::uint32_t>> wanted; // msg number, uid hash
+    std::vector<std::pair<long, int>> already; // msg number, summary index
+    std::vector<long> trash_delete;            // PREF_SERVER_DEL targets
+    for (long m = 1; m <= count; ++m) {
+        std::uint32_t h = kNeverHashed;
+        if (have_uidl) {
+            const auto it = uids.find(m);
+            if (it != uids.end())
+                h = kr_hash(it->second);
+        }
+        if (valid_hash(h) && server_delete.count(h)) {
+            trash_delete.push_back(m); // emptied from Trash: remove server-side
+            server_delete_remaining.erase(h);
+            continue;
+        }
+        int idx = -1;
+        if (valid_hash(h))
+            idx = mb->toc.find_by_hash(h);
+        if (idx >= 0) {
+            already.emplace_back(m, idx);
+            continue;
+        }
+        if (opts.max_message_k > 0) {
+            const auto sz = sizes.find(m);
+            if (sz != sizes.end() &&
+                sz->second > static_cast<long>(opts.max_message_k) * 1024)
+                continue; // over the limit: leave it on the server
+        }
+        wanted.emplace_back(m, h);
+    }
+
+    int32_t fetched = 0;
+    bool ok = true;
+
+    // Server-side cleanup of mail stored on an earlier check: everything
+    // with "delete from server" on, or just what has aged past the
+    // leave-on-server window (PREF_LMOS_XDAYS bookkeeping).
+    std::uint32_t age_cutoff = 0;
+    if (!delete_from_server && opts.leave_on_server_days > 0) {
+        const std::uint32_t window =
+            static_cast<std::uint32_t>(opts.leave_on_server_days) * 86400u;
+        const std::uint32_t now = mac_now_utc();
+        age_cutoff = now > window ? now - window : 1;
+    }
+    for (const auto &[m, idx] : already) {
+        const bool expired =
+            age_cutoff != 0 &&
+            mb->toc.sums[static_cast<std::size_t>(idx)].arrival_seconds <
+                age_cutoff;
+        if (!delete_from_server && !expired)
+            continue;
+        if (!pop.dele(m)) {
+            set_error("DELE failed: " + pop.last_response());
+            ok = false;
+            break;
+        }
+    }
+    // PREF_SERVER_DEL: remove messages the user emptied from Trash.
+    for (const long m : trash_delete) {
+        if (!ok)
+            break;
+        if (!pop.dele(m)) {
+            set_error("DELE failed: " + pop.last_response());
+            ok = false;
+        }
+    }
+
+    const long to_fetch = static_cast<long>(wanted.size());
+    for (long i = 0; i < to_fetch && ok; ++i) {
+        if (!report("retr", i, to_fetch))
+            break;
+        const long m = wanted[static_cast<std::size_t>(i)].first;
+        const std::uint32_t h = wanted[static_cast<std::size_t>(i)].second;
+        std::string message;
+        ok = pop.retrieve(m, [&](std::string_view line) {
+            message.append(line.data(), line.size());
+        });
+        if (!ok) {
+            set_error("RETR failed: " + pop.last_response());
+            break;
+        }
+        const int32_t idx = eudora_mailbox_append_message(
+            mb.get(), message.data(), message.size(), 0);
+        if (idx < 0) {
+            ok = false;
+            break;
+        }
+        // Stamp the UIDL hash so the next check skips this message.
+        if (valid_hash(h))
+            mb->toc.sums[static_cast<std::size_t>(idx)].uid_hash = h;
+        ++fetched;
+
+        if (delete_from_server && !pop.dele(m)) {
+            set_error("DELE failed: " + pop.last_response());
+            ok = false;
+        }
+    }
+
+    const bool cancelled = cancel_flag.load(std::memory_order_relaxed);
+    if (!cancelled) {
+        report("retr", fetched, to_fetch);
+        // On cancel, skip QUIT: the token makes it fail immediately anyway,
+        // and the server's RSET-on-drop keeps DELE'd messages (they stay
+        // deduped by their stored hashes).
+        pop.quit();
+        // Rewrite the server-delete list with the entries not matched this
+        // session (QUIT committed the DELEs).  Entries never seen on the
+        // server stay pending; ones we DELE'd drop out.
+        if (opts.server_delete_list && *opts.server_delete_list &&
+            server_delete_remaining.size() != server_delete.size()) {
+            std::FILE *sd = std::fopen(opts.server_delete_list, "w");
+            if (sd) {
+                for (const std::uint32_t h : server_delete_remaining)
+                    std::fprintf(sd, "%u\n", h);
+                std::fclose(sd);
+            }
+        }
+    }
+
+    if (!write_toc(mb->toc, mb->toc_file)) {
+        set_error("cannot write TOC");
+        return -1;
+    }
+    if (cancelled) {
+        set_error("cancelled");
+        return fetched;
+    }
+    return ok ? fetched : -1;
+    } catch (const std::exception &e) {
+        set_error(std::string("POP3 fetch failed: ") + e.what());
+        return -1;
+    } catch (...) {
+        set_error("POP3 fetch failed");
+        return -1;
+    }
+}
+
+int32_t eudora_pop3_fetch_ex(const char *host, uint16_t port, int tls_mode,
+                             const char *user, const char *password,
+                             const char *mbox_path, int delete_from_server,
+                             eudora_progress_fn progress, void *ctx) {
+    const eudora_pop3_options opts{delete_from_server, 0, 0, nullptr};
+    return eudora_pop3_fetch_opts(host, port, tls_mode, user, password,
+                                  mbox_path, &opts, progress, ctx);
+}
+
+int32_t eudora_pop3_fetch(const char *host, uint16_t port, int tls_mode,
+                          const char *user, const char *password,
+                          const char *mbox_path, int delete_from_server) {
+    return eudora_pop3_fetch_ex(host, port, tls_mode, user, password,
+                                mbox_path, delete_from_server, nullptr,
+                                nullptr);
+}
+
+/* ---- IMAP -------------------------------------------------------------- */
+
+int32_t eudora_imap_fetch_ex(const char *host, uint16_t port, int tls_mode,
+                             const char *user, const char *password,
+                             const char *imap_mailbox,
+                             const char *mbox_path, int delete_from_server,
+                             eudora_progress_fn progress, void *ctx) {
+    if (!host || !user || !password || !mbox_path) {
+        set_error("missing argument");
+        return -1;
+    }
+    if (has_control_break(user) || has_control_break(password) ||
+        has_control_break(imap_mailbox)) {
+        set_error("credentials or mailbox name contain a line break");
+        return -1;
+    }
+    // Untrusted server data drives allocations below; keep any exception
+    // from crossing the C boundary (see the catch at the end).
+    try {
+    const std::string remote_box =
+        imap_mailbox && *imap_mailbox ? imap_mailbox : "INBOX";
+
+    TransportBundle bundle;
+    Transport *transport = bundle.setup(tls_mode);
+    if (!transport)
+        return -1;
+    bundle.plain.set_recv_timeout(60);
+
+    std::atomic<bool> cancel_flag{false};
+    bundle.plain.set_cancel_flag(&cancel_flag);
+    if (bundle.active && bundle.active != &bundle.plain)
+        bundle.active->set_cancel_flag(&cancel_flag);
+    const auto report = [&](const char *stage, long done, long total) {
+        if (cancel_flag.load(std::memory_order_relaxed))
+            return false;
+        if (progress && progress(ctx, stage, static_cast<int32_t>(done),
+                                 static_cast<int32_t>(total)) != 0) {
+            cancel_flag.store(true, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    };
+
+    ImapSession imap(*transport);
+
+    if (!report("connect", 0, 0))
+        return 0;
+    if (transport->connect(host, port, 45) != NetError::None) {
+        set_error("cannot connect to " + std::string(host));
+        return -1;
+    }
+    if (tls_mode == EUDORA_TLS_IMMEDIATE && !bundle.start_tls(host))
+        return -1;
+    if (!imap.begin_connected()) {
+        set_error("no IMAP greeting");
+        return -1;
+    }
+    if (tls_mode == EUDORA_TLS_STARTTLS) {
+        if (!imap.request_starttls()) {
+            set_error("server refused STARTTLS: " + imap.last_response());
+            return -1;
+        }
+        if (!bundle.start_tls(host))
+            return -1;
+        imap.rescan_capabilities();
+    }
+    if (!report("auth", 0, 0))
+        return 0;
+    if (!imap.login(user, password)) {
+        set_error("authentication failed: " + imap.last_response());
+        return -1;
+    }
+
+    if (!report("list", 0, 0))
+        return 0;
+    ImapMailboxInfo info;
+    if (!imap.select(remote_box, info)) {
+        set_error("cannot select " + remote_box + ": " +
+                  imap.last_response());
+        return -1;
+    }
+
+    // Open (or create) the local mailbox and its TOC.
+    const std::filesystem::path box(mbox_path);
+    {
+        std::FILE *touch = std::fopen(box.string().c_str(), "ab");
+        if (!touch) {
+            set_error("cannot open mailbox for append");
+            return -1;
+        }
+        std::fclose(touch);
+    }
+    std::unique_ptr<eudora_mailbox> mb(eudora_mailbox_open(mbox_path));
+    if (!mb)
+        return -1;
+
+    // Enumerate UIDs and flags; dedup on kr_hash("uidvalidity/uid") — the
+    // IMAP analog of the POP UIDL bookkeeping.  An empty mailbox skips the
+    // 1:* fetch (some servers reject it outright).
+    struct WantedMsg {
+        std::uint32_t uid;
+        std::uint32_t hash;
+    };
+    std::vector<WantedMsg> wanted;
+    std::vector<std::uint32_t> already;
+    if (info.exists > 0) {
+        const auto listing = imap.uid_fetch("1:*", "(UID FLAGS)");
+        if (!listing) {
+            set_error("UID FETCH failed: " + imap.last_response());
+            return -1;
+        }
+        for (const auto &r : *listing) {
+            if (r.uid == 0)
+                continue;
+            const std::uint32_t h =
+                kr_hash(std::to_string(info.uid_validity) + "/" +
+                        std::to_string(r.uid));
+            if (valid_hash(h) && mb->toc.find_by_hash(h) >= 0)
+                already.push_back(r.uid);
+            else
+                wanted.push_back({r.uid, h});
+        }
+    }
+
+    int32_t fetched = 0;
+    bool ok = true;
+    std::vector<std::uint32_t> to_delete;
+    if (delete_from_server)
+        to_delete = already;
+
+    const long total = static_cast<long>(wanted.size());
+    for (long i = 0; i < total && ok; ++i) {
+        if (!report("retr", i, total))
+            break;
+        const WantedMsg &w = wanted[static_cast<std::size_t>(i)];
+        const auto result =
+            imap.uid_fetch(std::to_string(w.uid), "(UID FLAGS BODY.PEEK[])");
+        if (!result) {
+            set_error("UID FETCH failed: " + imap.last_response());
+            ok = false;
+            break;
+        }
+        const ImapFetchResult *msg = nullptr;
+        for (const auto &r : *result)
+            if (r.uid == w.uid && !r.body.empty())
+                msg = &r;
+        if (!msg)
+            continue; // vanished between listing and fetch
+        // Stamp the server identity so flag changes can be written back
+        // later (eudora_imap_sync_flags): "<uidvalidity>.<uid>".
+        std::string stamped = "X-Eudora-Imap-Uid: " +
+                              std::to_string(info.uid_validity) + "." +
+                              std::to_string(w.uid) + "\r\n" + msg->body;
+        const int32_t idx = eudora_mailbox_append_message(
+            mb.get(), stamped.data(), stamped.size(),
+            imap_flags_to_state(msg->flags));
+        if (idx < 0) {
+            ok = false;
+            break;
+        }
+        if (valid_hash(w.hash))
+            mb->toc.sums[static_cast<std::size_t>(idx)].uid_hash = w.hash;
+        ++fetched;
+        if (delete_from_server)
+            to_delete.push_back(w.uid);
+    }
+
+    const bool cancelled = cancel_flag.load(std::memory_order_relaxed);
+    if (!cancelled) {
+        report("retr", fetched, total);
+        if (ok && delete_from_server && !to_delete.empty()) {
+            std::string uid_set;
+            for (const std::uint32_t uid : to_delete) {
+                if (!uid_set.empty())
+                    uid_set += ',';
+                uid_set += std::to_string(uid);
+            }
+            if (imap.uid_store(uid_set, "+FLAGS.SILENT", "\\Deleted"))
+                imap.expunge();
+        }
+        imap.logout();
+    }
+
+    if (!write_toc(mb->toc, mb->toc_file)) {
+        set_error("cannot write TOC");
+        return -1;
+    }
+    if (cancelled) {
+        set_error("cancelled");
+        return fetched;
+    }
+    return ok ? fetched : -1;
+    } catch (const std::exception &e) {
+        set_error(std::string("IMAP fetch failed: ") + e.what());
+        return -1;
+    } catch (...) {
+        set_error("IMAP fetch failed");
+        return -1;
+    }
+}
+
+extern "C++" {
+namespace {
+
+// Connect, (optionally upgrade), and log in; run fn(imap); log out.
+template <class F>
+bool with_imap_session(const char *host, std::uint16_t port, int tls_mode,
+                       const char *user, const char *password, F &&fn) {
+    TransportBundle bundle;
+    Transport *transport = bundle.setup(tls_mode);
+    if (!transport)
+        return false;
+    bundle.plain.set_recv_timeout(60);
+    if (transport->connect(host, port, 45) != NetError::None) {
+        set_error("cannot connect to " + std::string(host));
+        return false;
+    }
+    if (tls_mode == EUDORA_TLS_IMMEDIATE && !bundle.start_tls(host))
+        return false;
+    ImapSession imap(*transport);
+    if (!imap.begin_connected()) {
+        set_error("no IMAP greeting");
+        return false;
+    }
+    if (tls_mode == EUDORA_TLS_STARTTLS) {
+        if (!imap.request_starttls()) {
+            set_error("server refused STARTTLS: " + imap.last_response());
+            return false;
+        }
+        if (!bundle.start_tls(host))
+            return false;
+        imap.rescan_capabilities();
+    }
+    if (!imap.login(user, password)) {
+        set_error("authentication failed: " + imap.last_response());
+        return false;
+    }
+    const bool r = fn(imap);
+    imap.logout();
+    return r;
+}
+
+bool iattr_is(std::string_view a, std::string_view b) {
+    if (a.size() != b.size())
+        return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    return true;
+}
+
+} // namespace
+} // extern "C++"
+
+char **eudora_imap_list_folders(const char *host, uint16_t port, int tls_mode,
+                                const char *user, const char *password) {
+    if (!host || !user || !password) {
+        set_error("missing argument");
+        return nullptr;
+    }
+    if (has_control_break(user) || has_control_break(password)) {
+        set_error("credentials contain a line break");
+        return nullptr;
+    }
+    std::vector<std::string> names;
+    try {
+        const bool ok = with_imap_session(
+            host, port, tls_mode, user, password, [&](ImapSession &imap) {
+                auto entries = imap.list("", "*");
+                if (!entries)
+                    return false;
+                for (const auto &e : *entries) {
+                    bool selectable = true;
+                    for (const auto &a : e.attributes)
+                        if (iattr_is(a, "\\Noselect"))
+                            selectable = false;
+                    if (selectable && !e.name.empty())
+                        names.push_back(e.name);
+                }
+                return true;
+            });
+        if (!ok)
+            return nullptr;
+    } catch (...) {
+        set_error("IMAP list failed");
+        return nullptr;
+    }
+    auto *arr = static_cast<char **>(std::calloc(names.size() + 1, sizeof(char *)));
+    if (!arr)
+        return nullptr;
+    for (std::size_t i = 0; i < names.size(); ++i)
+        arr[i] = dup_string(names[i]);
+    return arr;
+}
+
+int32_t eudora_imap_sync_flags(const char *host, uint16_t port, int tls_mode,
+                               const char *user, const char *password,
+                               const char *imap_mailbox,
+                               const char *mbox_path) {
+    if (!host || !user || !password || !mbox_path) {
+        set_error("missing argument");
+        return -1;
+    }
+    if (has_control_break(user) || has_control_break(password) ||
+        has_control_break(imap_mailbox)) {
+        set_error("credentials or mailbox name contain a line break");
+        return -1;
+    }
+    const std::string remote_box =
+        imap_mailbox && *imap_mailbox ? imap_mailbox : "INBOX";
+
+    std::unique_ptr<eudora_mailbox> mb(eudora_mailbox_open(mbox_path));
+    if (!mb)
+        return -1;
+
+    // Gather (uidvalidity, uid, seen, answered) for every stamped message.
+    struct Want {
+        std::uint32_t validity, uid;
+        bool seen, answered;
+    };
+    std::vector<Want> wants;
+    for (int i = 0; i < mb->toc.count(); ++i) {
+        const MessageSummary &s = mb->toc.sums[static_cast<std::size_t>(i)];
+        if (s.offset < 0)
+            continue;
+        const std::string raw =
+            read_file_range(mb->toc.mailbox_path, s.offset, s.length);
+        const HeaderSet hs = HeaderSet::parse(split_message(raw).header_block);
+        const auto stamp = hs.get("X-Eudora-Imap-Uid");
+        if (!stamp)
+            continue;
+        const std::string v(*stamp);
+        const auto dot = v.find('.');
+        if (dot == std::string::npos)
+            continue;
+        Want w;
+        w.validity = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+        w.uid = static_cast<std::uint32_t>(
+            std::strtoul(v.c_str() + dot + 1, nullptr, 10));
+        w.seen = s.state != MessageState::Unread;
+        w.answered = s.state == MessageState::Replied ||
+                     s.state == MessageState::Redistributed;
+        if (w.uid && (w.seen || w.answered))
+            wants.push_back(w);
+    }
+    if (wants.empty())
+        return 0;
+
+    int32_t synced = 0;
+    try {
+        const bool ok = with_imap_session(
+            host, port, tls_mode, user, password, [&](ImapSession &imap) {
+                ImapMailboxInfo info;
+                if (!imap.select(remote_box, info)) {
+                    set_error("cannot select " + remote_box);
+                    return false;
+                }
+                for (const auto &w : wants) {
+                    if (w.validity != info.uid_validity)
+                        continue; // stale mapping (mailbox reset)
+                    bool did = false;
+                    if (w.seen)
+                        did |= imap.uid_store(std::to_string(w.uid),
+                                              "+FLAGS.SILENT", "\\Seen");
+                    if (w.answered)
+                        did |= imap.uid_store(std::to_string(w.uid),
+                                              "+FLAGS.SILENT", "\\Answered");
+                    if (did)
+                        ++synced;
+                }
+                return true;
+            });
+        if (!ok)
+            return -1;
+    } catch (...) {
+        set_error("IMAP sync failed");
+        return -1;
+    }
+    return synced;
+}
+
+/* ---- SMTP -------------------------------------------------------------- */
+
+int eudora_smtp_send(const char *host, uint16_t port, int tls_mode,
+                     const char *user, const char *password,
+                     const char *from, const char *recipients,
+                     const char *message, size_t message_len) {
+    if (!host || !from || !recipients || !message) {
+        set_error("missing argument");
+        return 601;
+    }
+    // from goes straight into MAIL FROM:<…>; user/password into AUTH.  A
+    // line break in any of them would inject additional SMTP commands.
+    if (has_control_break(from) || has_control_break(user) ||
+        has_control_break(password)) {
+        set_error("sender or credentials contain a line break");
+        return 601;
+    }
+
+    TransportBundle bundle;
+    Transport *transport = bundle.setup(tls_mode);
+    if (!transport)
+        return 601;
+    // Same watchdog as the POP engine: never block forever on a dead server.
+    bundle.plain.set_recv_timeout(60);
+
+    SmtpSession smtp(*transport);
+
+    if (transport->connect(host, port, 45) != NetError::None) {
+        set_error("cannot connect to " + std::string(host));
+        return 601;
+    }
+    if (tls_mode == EUDORA_TLS_IMMEDIATE && !bundle.start_tls(host))
+        return 601;
+    if (!smtp.begin_connected()) {
+        set_error("SMTP greeting/EHLO failed: " + smtp.last_reply());
+        return smtp.last_code();
+    }
+    if (tls_mode == EUDORA_TLS_STARTTLS) {
+        if (!smtp.request_starttls()) {
+            set_error("server refused STARTTLS: " + smtp.last_reply());
+            return smtp.last_code();
+        }
+        if (!bundle.start_tls(host))
+            return 601;
+        if (!smtp.ehlo_again()) {
+            set_error("EHLO after STARTTLS failed");
+            return smtp.last_code();
+        }
+    }
+    if (user && *user && smtp.extensions().sasl != SaslMechanism::None) {
+        if (!smtp.auth(user, password ? password : "")) {
+            set_error("SMTP auth failed: " + smtp.last_reply());
+            return smtp.last_code();
+        }
+    }
+    if (!smtp.mail_from(from, static_cast<long>(message_len))) {
+        set_error("MAIL FROM refused: " + smtp.last_reply());
+        return smtp.last_code();
+    }
+    auto rcpts = parse_addresses(recipients, false);
+    if (!rcpts || rcpts->empty()) {
+        set_error("no valid recipients");
+        return 550;
+    }
+    for (const auto &r : *rcpts) {
+        if (r.empty() || r == ";" || r.back() == ':')
+            continue; // group-syntax markers
+        if (!smtp.rcpt_to(r)) {
+            set_error("RCPT refused for " + r + ": " + smtp.last_reply());
+            return smtp.last_code();
+        }
+    }
+    if (!smtp.data(std::string_view(message, message_len))) {
+        set_error("DATA failed: " + smtp.last_reply());
+        return smtp.last_code();
+    }
+    const int code = smtp.last_code();
+    smtp.quit();
+    return code;
+}
+
+/* ---- message composition ----------------------------------------------- */
+
+eudora_composer *eudora_composer_new(void) {
+    return reinterpret_cast<eudora_composer *>(new MessageComposer());
+}
+
+void eudora_composer_free(eudora_composer *c) {
+    delete reinterpret_cast<MessageComposer *>(c);
+}
+
+static MessageComposer *comp_mut(eudora_composer *c) {
+    return reinterpret_cast<MessageComposer *>(c);
+}
+static const MessageComposer *comp(const eudora_composer *c) {
+    return reinterpret_cast<const MessageComposer *>(c);
+}
+
+void eudora_composer_from(eudora_composer *c, const char *name,
+                          const char *address) {
+    if (c && address)
+        comp_mut(c)->from(name ? name : "", address);
+}
+void eudora_composer_to(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->to(v);
+}
+void eudora_composer_cc(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->cc(v);
+}
+void eudora_composer_bcc(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->bcc(v);
+}
+void eudora_composer_reply_to(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->reply_to(v);
+}
+void eudora_composer_subject(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->subject(v);
+}
+void eudora_composer_body(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->body(v);
+}
+void eudora_composer_html_body(eudora_composer *c, const char *v) {
+    if (c && v)
+        comp_mut(c)->html_body(v);
+}
+void eudora_composer_header(eudora_composer *c, const char *name,
+                            const char *value) {
+    if (c && name && value)
+        comp_mut(c)->header(name, value);
+}
+void eudora_composer_priority(eudora_composer *c, int p) {
+    if (c)
+        comp_mut(c)->priority(p);
+}
+void eudora_composer_attach(eudora_composer *c, const char *path,
+                            const char *content_type, const char *filename) {
+    if (c && path)
+        comp_mut(c)->attach({path, content_type ? content_type : "",
+                         filename ? filename : ""});
+}
+
+char *eudora_composer_build(const eudora_composer *c) {
+    if (!c)
+        return nullptr;
+    return guard("build message", [&]() -> char * {
+        auto built = comp(c)->build();
+        if (!built) {
+            set_error("cannot read attachment");
+            return nullptr;
+        }
+        return dup_string(*built);
+    });
+}
+
+char *eudora_composer_sender(const eudora_composer *c) {
+    return c ? dup_string(comp(c)->sender()) : nullptr;
+}
+
+char *eudora_composer_recipients(const eudora_composer *c) {
+    if (!c)
+        return nullptr;
+    std::string joined;
+    for (const auto &r : comp(c)->recipients()) {
+        if (!joined.empty())
+            joined += ", ";
+        joined += r;
+    }
+    return dup_string(joined);
+}
+
+/* ---- address book ------------------------------------------------------ */
+
+eudora_addressbook *eudora_addressbook_load(const char *path) {
+    if (!path)
+        return nullptr;
+    return guard("load address book", [&]() -> eudora_addressbook * {
+        auto loaded = AddressBook::load(path);
+        if (!loaded) {
+            set_error("cannot read address book");
+            return nullptr;
+        }
+        auto ab = std::make_unique<eudora_addressbook>();
+        ab->book = std::move(*loaded);
+        return ab.release();
+    });
+}
+
+eudora_addressbook *eudora_addressbook_parse(const char *text) {
+    if (!text)
+        return nullptr;
+    return guard("parse address book", [&]() -> eudora_addressbook * {
+        auto ab = std::make_unique<eudora_addressbook>();
+        ab->book = AddressBook::parse(text);
+        return ab.release();
+    });
+}
+
+void eudora_addressbook_free(eudora_addressbook *ab) { delete ab; }
+
+int eudora_addressbook_save(const eudora_addressbook *ab, const char *path) {
+    if (!ab || !path)
+        return 0;
+    return ab->book.save(path) ? 1 : 0;
+}
+
+int32_t eudora_addressbook_count(const eudora_addressbook *ab) {
+    return ab ? static_cast<int32_t>(ab->book.nicknames().size()) : 0;
+}
+
+const char *eudora_addressbook_name(const eudora_addressbook *ab, int32_t i) {
+    if (!ab || i < 0 || i >= eudora_addressbook_count(ab))
+        return nullptr;
+    return ab->book.nicknames()[static_cast<std::size_t>(i)].name.c_str();
+}
+
+const char *eudora_addressbook_addresses(const eudora_addressbook *ab,
+                                         int32_t i) {
+    if (!ab || i < 0 || i >= eudora_addressbook_count(ab))
+        return nullptr;
+    return ab->book.nicknames()[static_cast<std::size_t>(i)].addresses.c_str();
+}
+
+const char *eudora_addressbook_notes(const eudora_addressbook *ab, int32_t i) {
+    if (!ab || i < 0 || i >= eudora_addressbook_count(ab))
+        return nullptr;
+    return ab->book.nicknames()[static_cast<std::size_t>(i)].notes.c_str();
+}
+
+int eudora_addressbook_set(eudora_addressbook *ab, const char *name,
+                           const char *addresses, const char *notes) {
+    if (!ab || !name || !*name)
+        return 0;
+    Nickname n;
+    n.name = name;
+    n.addresses = addresses ? addresses : "";
+    n.notes = notes ? notes : "";
+    auto parsed = parse_addresses(n.addresses, false);
+    n.group = parsed && parsed->size() > 1;
+    ab->book.set(std::move(n));
+    return 1;
+}
+
+int eudora_addressbook_remove(eudora_addressbook *ab, const char *name) {
+    if (!ab || !name)
+        return 0;
+    return ab->book.remove(name) ? 1 : 0;
+}
+
+int32_t eudora_addressbook_import_contacts(eudora_addressbook *ab,
+                                           const char *text, int overwrite) {
+    if (!ab || !text)
+        return 0;
+    return guard("import contacts", [&]() -> int32_t {
+        const auto parsed = AddressBook::import_contacts(text);
+        return ab->book.merge(parsed, overwrite != 0);
+    });
+}
+
+char **eudora_addressbook_expand(const eudora_addressbook *ab,
+                                 const char *address_list) {
+    if (!ab || !address_list)
+        return nullptr;
+    return guard("expand address list", [&]() -> char ** {
+        const auto expanded = ab->book.expand(address_list);
+        char **arr = static_cast<char **>(
+            std::calloc(expanded.size() + 1, sizeof(char *)));
+        if (!arr)
+            return nullptr;
+        for (std::size_t i = 0; i < expanded.size(); ++i)
+            arr[i] = dup_string(expanded[i]);
+        return arr;
+    });
+}
+
+int eudora_addressbook_contains(const eudora_addressbook *ab,
+                                const char *address) {
+    if (!ab || !address)
+        return 0;
+    return ab->book.contains_address(address) ? 1 : 0;
+}
+
+/* ---- filters ----------------------------------------------------------- */
+
+eudora_filters *eudora_filters_load(const char *path) {
+    if (!path)
+        return nullptr;
+    return guard("load filters", [&]() -> eudora_filters * {
+        auto loaded = read_filters(path);
+        if (!loaded) {
+            set_error("cannot read filters file");
+            return nullptr;
+        }
+        auto f = std::make_unique<eudora_filters>();
+        f->filters = std::move(*loaded);
+        return f.release();
+    });
+}
+
+eudora_filters *eudora_filters_parse(const char *text) {
+    if (!text)
+        return nullptr;
+    auto f = std::make_unique<eudora_filters>();
+    f->filters = parse_filters(text);
+    return f.release();
+}
+
+eudora_filters *eudora_filters_new(void) { return new eudora_filters(); }
+
+void eudora_filters_free(eudora_filters *f) { delete f; }
+
+int32_t eudora_filters_count(const eudora_filters *f) {
+    return f ? static_cast<int32_t>(f->filters.size()) : 0;
+}
+
+extern "C++" {
+namespace {
+
+Filter *filter_at_mut(eudora_filters *f, int32_t index) {
+    if (!f || index < 0 || index >= static_cast<int32_t>(f->filters.size()))
+        return nullptr;
+    return &f->filters[static_cast<std::size_t>(index)];
+}
+
+const Filter *filter_at(const eudora_filters *f, int32_t index) {
+    return filter_at_mut(const_cast<eudora_filters *>(f), index);
+}
+
+// Static storage for the enum-name strings handed back by _get.
+const char *verb_cstr(FilterVerb v) {
+    switch (v) {
+    case FilterVerb::Contains: return "contains";
+    case FilterVerb::NotContains: return "!contains";
+    case FilterVerb::Is: return "is";
+    case FilterVerb::Isnt: return "!is";
+    case FilterVerb::Starts: return "starts";
+    case FilterVerb::Ends: return "ends";
+    case FilterVerb::Appears: return "appears";
+    case FilterVerb::NotAppears: return "!appears";
+    case FilterVerb::Intersects: return "intersects";
+    case FilterVerb::NotIntersects: return "disjoint";
+    case FilterVerb::IntersectsFile: return "intersectsFile";
+    case FilterVerb::NotIntersectsFile: return "disjointFile";
+    case FilterVerb::Regex: return "regex";
+    case FilterVerb::JunkLess: return "less";
+    case FilterVerb::JunkMore: return "greater";
+    }
+    return "contains";
+}
+
+const char *conjunction_cstr(FilterConjunction c) {
+    switch (c) {
+    case FilterConjunction::And: return "and";
+    case FilterConjunction::Or: return "or";
+    case FilterConjunction::Unless: return "unless";
+    default: return "ignore";
+    }
+}
+
+} // namespace
+} // extern "C++"
+
+int eudora_filters_get(const eudora_filters *f, int32_t index,
+                       eudora_filter_info *out) {
+    const Filter *fr = filter_at(f, index);
+    if (!fr || !out)
+        return 0;
+    out->name = fr->name.c_str();
+    out->id = fr->id;
+    out->incoming = fr->incoming ? 1 : 0;
+    out->outgoing = fr->outgoing ? 1 : 0;
+    out->manual = fr->manual ? 1 : 0;
+    out->header1 = fr->terms[0].header.c_str();
+    out->verb1 = verb_cstr(fr->terms[0].verb);
+    out->value1 = fr->terms[0].value.c_str();
+    out->conjunction = conjunction_cstr(fr->conjunction);
+    out->header2 = fr->terms[1].header.c_str();
+    out->verb2 = verb_cstr(fr->terms[1].verb);
+    out->value2 = fr->terms[1].value.c_str();
+    return 1;
+}
+
+int eudora_filters_set(eudora_filters *f, int32_t index,
+                       const eudora_filter_info *in) {
+    Filter *fr = filter_at_mut(f, index);
+    if (!fr || !in)
+        return 0;
+    if (in->name)
+        fr->name = in->name;
+    fr->incoming = in->incoming != 0;
+    fr->outgoing = in->outgoing != 0;
+    fr->manual = in->manual != 0;
+    if (in->header1)
+        fr->terms[0].header = in->header1;
+    if (in->verb1) {
+        if (auto v = filter_verb_from_string(in->verb1))
+            fr->terms[0].verb = *v;
+    }
+    if (in->value1) {
+        fr->terms[0].value = in->value1;
+        fr->terms[0].regex_cache.reset();
+    }
+    if (in->conjunction) {
+        if (auto c = filter_conjunction_from_string(in->conjunction))
+            fr->conjunction = *c;
+    }
+    if (in->header2)
+        fr->terms[1].header = in->header2;
+    if (in->verb2) {
+        if (auto v = filter_verb_from_string(in->verb2))
+            fr->terms[1].verb = *v;
+    }
+    if (in->value2) {
+        fr->terms[1].value = in->value2;
+        fr->terms[1].regex_cache.reset();
+    }
+    return 1;
+}
+
+int32_t eudora_filters_add(eudora_filters *f, const char *name) {
+    if (!f)
+        return -1;
+    Filter fr;
+    fr.name = name && *name ? name : "Untitled";
+    fr.incoming = true;
+    std::int32_t max_id = 0;
+    for (const auto &existing : f->filters)
+        if (existing.id > max_id)
+            max_id = existing.id;
+    fr.id = max_id + 1;
+    f->filters.push_back(std::move(fr));
+    return static_cast<int32_t>(f->filters.size()) - 1;
+}
+
+int eudora_filters_remove(eudora_filters *f, int32_t index) {
+    if (!filter_at_mut(f, index))
+        return 0;
+    f->filters.erase(f->filters.begin() + index);
+    return 1;
+}
+
+int eudora_filters_move(eudora_filters *f, int32_t from, int32_t to) {
+    if (!filter_at_mut(f, from) || !filter_at_mut(f, to))
+        return 0;
+    Filter moved = std::move(f->filters[static_cast<std::size_t>(from)]);
+    f->filters.erase(f->filters.begin() + from);
+    f->filters.insert(f->filters.begin() + to, std::move(moved));
+    return 1;
+}
+
+int32_t eudora_filter_action_count(const eudora_filters *f, int32_t index) {
+    const Filter *fr = filter_at(f, index);
+    return fr ? static_cast<int32_t>(fr->actions.size()) : 0;
+}
+
+int eudora_filter_action_get(const eudora_filters *f, int32_t index,
+                             int32_t action, const char **keyword,
+                             const char **value) {
+    const Filter *fr = filter_at(f, index);
+    if (!fr || action < 0 ||
+        action >= static_cast<int32_t>(fr->actions.size()))
+        return 0;
+    const FilterAction &a = fr->actions[static_cast<std::size_t>(action)];
+    if (keyword) {
+        const std::string_view kw = filter_keyword_string(a.keyword);
+        *keyword = kw.data(); // static table entries are NUL-terminated
+    }
+    if (value)
+        *value = a.value.c_str();
+    return 1;
+}
+
+int eudora_filter_action_add(eudora_filters *f, int32_t index,
+                             const char *keyword, const char *value) {
+    Filter *fr = filter_at_mut(f, index);
+    if (!fr || !keyword)
+        return 0;
+    const FilterKeyword k = filter_keyword_from_string(keyword);
+    if (!filter_keyword_is_action(k))
+        return 0;
+    fr->actions.push_back({k, value ? value : ""});
+    return 1;
+}
+
+int eudora_filter_action_set(eudora_filters *f, int32_t index, int32_t action,
+                             const char *keyword, const char *value) {
+    Filter *fr = filter_at_mut(f, index);
+    if (!fr || action < 0 ||
+        action >= static_cast<int32_t>(fr->actions.size()))
+        return 0;
+    FilterAction &a = fr->actions[static_cast<std::size_t>(action)];
+    if (keyword) {
+        const FilterKeyword k = filter_keyword_from_string(keyword);
+        if (!filter_keyword_is_action(k))
+            return 0;
+        a.keyword = k;
+    }
+    if (value)
+        a.value = value;
+    return 1;
+}
+
+int eudora_filter_action_remove(eudora_filters *f, int32_t index,
+                                int32_t action) {
+    Filter *fr = filter_at_mut(f, index);
+    if (!fr || action < 0 ||
+        action >= static_cast<int32_t>(fr->actions.size()))
+        return 0;
+    fr->actions.erase(fr->actions.begin() + action);
+    return 1;
+}
+
+int eudora_filters_save(const eudora_filters *f, const char *path) {
+    if (!f || !path)
+        return 0;
+    return write_filters(f->filters, path) ? 1 : 0;
+}
+
+extern "C++" {
+namespace {
+
+eudora_fired_action *run_filters_c(const std::vector<Filter> &filters,
+                                   int event, std::string_view raw,
+                                   const MessageSummary *summary,
+                                   const eudora_addressbook *book,
+                                   int32_t *out_count) {
+    *out_count = 0;
+    // Matching hostile input allocates (per-term haystacks, the fired list);
+    // keep a bad_alloc/length_error off the C boundary (no actions fire,
+    // *out_count stays 0).
+    return guard("run filters", [&]() -> eudora_fired_action * {
+        FilterEvent ev = FilterEvent::Incoming;
+        if (event == EUDORA_FILTER_OUTGOING)
+            ev = FilterEvent::Outgoing;
+        else if (event == EUDORA_FILTER_MANUAL)
+            ev = FilterEvent::Manual;
+
+        FilterContext ctx;
+        ctx.raw_message = raw;
+        ctx.summary = summary; // enables score/status/priority/date terms
+        if (book) {
+            ctx.address_in_book =
+                [book](std::string_view addr, std::string_view) {
+                    return book->book.contains_address(addr);
+                };
+        }
+        const auto fired = run_filters(filters, ev, ctx);
+        if (fired.empty())
+            return nullptr;
+
+        auto *arr = static_cast<eudora_fired_action *>(
+            std::calloc(fired.size(), sizeof(eudora_fired_action)));
+        if (!arr)
+            return nullptr;
+        for (std::size_t i = 0; i < fired.size(); ++i) {
+            arr[i].filter_name = dup_string(fired[i].filter->name);
+            arr[i].keyword =
+                dup_string(filter_keyword_string(fired[i].action.keyword));
+            arr[i].value = dup_string(fired[i].action.value);
+        }
+        *out_count = static_cast<int32_t>(fired.size());
+        return arr;
+    });
+}
+
+} // namespace
+} // extern "C++"
+
+eudora_fired_action *eudora_filters_run(const eudora_filters *f, int event,
+                                        const char *raw_message, size_t len,
+                                        int32_t *out_count) {
+    return eudora_filters_run_with_book(f, event, raw_message, len, nullptr,
+                                        out_count);
+}
+
+eudora_fired_action *eudora_filters_run_with_book(
+    const eudora_filters *f, int event, const char *raw_message, size_t len,
+    const eudora_addressbook *book, int32_t *out_count) {
+    if (!f || !raw_message || !out_count)
+        return nullptr;
+    return run_filters_c(f->filters, event,
+                         std::string_view(raw_message, len), nullptr, book,
+                         out_count);
+}
+
+eudora_fired_action *eudora_filters_run_in_mailbox(
+    const eudora_filters *f, int event, const eudora_mailbox *mb, int32_t index,
+    const eudora_addressbook *book, int32_t *out_count) {
+    if (!f || !mb || !out_count || index < 0 || index >= mb->toc.count())
+        return nullptr;
+    *out_count = 0;
+    // The message text AND its summary, so junk-score / status / priority /
+    // date TERMS can match (FilterContext.summary), not just header/body
+    // string terms.  run_filters_c guards the regex/allocation; guard the
+    // file read here too (a corrupt length can drive a huge allocation).
+    return guard("run filters in mailbox", [&]() -> eudora_fired_action * {
+        const MessageSummary &sum =
+            mb->toc.sums[static_cast<std::size_t>(index)];
+        std::string raw;
+        if (sum.offset >= 0)
+            raw = read_file_range(mb->toc.mailbox_path, sum.offset, sum.length);
+        return run_filters_c(f->filters, event, raw, &sum, book, out_count);
+    });
+}
+
+void eudora_fired_actions_free(eudora_fired_action *actions, int32_t count) {
+    if (!actions)
+        return;
+    for (int32_t i = 0; i < count; ++i) {
+        std::free(const_cast<char *>(actions[i].filter_name));
+        std::free(const_cast<char *>(actions[i].keyword));
+        std::free(const_cast<char *>(actions[i].value));
+    }
+    std::free(actions);
+}
+
+} // extern "C"

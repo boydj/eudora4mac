@@ -1,0 +1,4 @@
+module CEudoraCore {
+    header "eudora/eudora_core.h"
+    export *
+}
