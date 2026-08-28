@@ -48,22 +48,39 @@ jobs:
           defaults write net.jbip.eudora mailFolderPath "$DEMO_FOLDER"
           defaults write net.jbip.eudora NSQuitAlwaysKeepsWindows -bool false
 
-      - name: Launch and screenshot the main window
+      - name: Launch and screenshot every screen
         run: |
           set -x
           mkdir -p docs/screenshots
-          open dist/Eudora.app
-          # Give the app time to open its window and build the demo TOCs.
-          sleep 15
-          osascript -e 'tell application "Eudora" to activate' || true
-          sleep 3
-          screencapture -x docs/screenshots/main.png
-          killall EudoraApp || true
-          echo "--- captured image ---"
+          # "EUDORA_SHOT value : output file name"; the app's screenshot
+          # director (MainWindow) drives the UI to each screen on launch.
+          shots=(
+            "inbox:1-inbox.png"
+            "message:2-reading-a-message.png"
+            "compose:3-composing.png"
+            "settings:4-settings.png"
+            "filters:5-filters.png"
+            "addressbook:6-address-book.png"
+          )
+          for entry in "${shots[@]}"; do
+            shot="${entry%%:*}"; file="${entry##*:}"
+            echo "::group::capture $shot -> $file"
+            # launchctl setenv makes the value visible to GUI apps opened next.
+            launchctl setenv EUDORA_SHOT "$shot"
+            open dist/Eudora.app
+            sleep 12   # window build + demo TOC build + director delay
+            osascript -e 'tell application "Eudora" to activate' || true
+            sleep 2
+            screencapture -x "docs/screenshots/$file"
+            killall EudoraApp 2>/dev/null || true
+            launchctl unsetenv EUDORA_SHOT
+            sleep 2
+            sips -g pixelWidth -g pixelHeight "docs/screenshots/$file" || true
+            test -s "docs/screenshots/$file"
+            echo "::endgroup::"
+          done
+          echo "--- captured images ---"
           ls -l docs/screenshots
-          sips -g pixelWidth -g pixelHeight docs/screenshots/main.png || true
-          # Fail early if nothing was captured.
-          test -s docs/screenshots/main.png
 
       - name: Upload screenshots artifact
         uses: actions/upload-artifact@v4

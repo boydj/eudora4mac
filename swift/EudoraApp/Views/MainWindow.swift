@@ -5,6 +5,7 @@
 
 #if os(macOS)
 
+import AppKit
 import EudoraKit
 import SwiftUI
 
@@ -50,6 +51,70 @@ struct MainWindow: View {
             Button("Cancel", role: .cancel) { newMailboxName = "" }
         } message: {
             Text("Creating a mailbox called:")
+        }
+        .task { await runScreenshotDirectorIfRequested() }
+    }
+
+    /// Screenshot support (used only by the Screenshots CI action): when the
+    /// EUDORA_SHOT environment variable names a screen, drive the UI to it on
+    /// launch so `screencapture` grabs a deterministic view.  A no-op in
+    /// normal use.
+    @MainActor
+    private func runScreenshotDirectorIfRequested() async {
+        guard let shot = ProcessInfo.processInfo.environment["EUDORA_SHOT"],
+              !shot.isEmpty else { return }
+        // Let the window and mailbox list build first.
+        try? await Task.sleep(nanoseconds: 1_800_000_000)
+        model.selectedMailbox = "In"
+
+        func firstInboxRef() -> MessageRef? {
+            guard let mb = model.mailbox(named: "In"), mb.count > 0,
+                  let sum = mb.summary(at: 0) else { return nil }
+            return MessageRef(mailbox: "In", index: 0, serial: sum.serialNumber)
+        }
+
+        switch shot {
+        case "inbox", "main":
+            // Select the first message so the preview shows an open email.
+            model.selectedMessage = 0
+        case "message":
+            model.selectedMessage = 0
+            if let ref = firstInboxRef() { openWindow(id: "message", value: ref) }
+            hideMainWindow()
+        case "compose":
+            if let seed = model.composeSeed(.reply, mailbox: "In", index: 0) {
+                openWindow(id: "compose", value: seed)
+            } else {
+                openWindow(id: "compose")
+            }
+            hideMainWindow()
+        case "filters":
+            openWindow(id: "filters")
+            hideMainWindow()
+        case "addressbook":
+            openWindow(id: "addressbook")
+            hideMainWindow()
+        case "settings":
+            if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+                _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+            }
+            hideMainWindow()
+        default:
+            break
+        }
+    }
+
+    /// Orders every window except the newly-opened front one out of view, so
+    /// a full-screen capture shows just the target screen.  Best-effort.
+    private func hideMainWindow() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            let front = NSApp.keyWindow ?? NSApp.orderedWindows.first
+            for window in NSApp.windows
+            where window != front && window.isVisible && window.canBecomeKey {
+                window.orderOut(nil)
+            }
+            front?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
         }
     }
 
