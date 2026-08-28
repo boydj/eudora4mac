@@ -56,7 +56,7 @@ struct MailboxPane: View {
             .width(18)
 
             TableColumn("L") { row in
-                if let color = ClassicStyle.labelColor(row.summary.labelIndex) {
+                if let color = model.settings.labelColor(row.summary.labelIndex) {
                     Circle().fill(color).frame(width: 10, height: 10)
                 }
             }
@@ -85,6 +85,7 @@ struct MailboxPane: View {
             }
             .width(min: 180, ideal: 340)
         }
+        .font(.system(size: CGFloat(model.settings.displayFontSize)))
         .contextMenu(forSelectionType: Int.self) { selection in
             messageContextMenu(selection: selection)
         } primaryAction: { selection in
@@ -111,15 +112,16 @@ struct MailboxPane: View {
                 statusButton("Forwarded", .forwarded, index)
             }
             Menu("Label") {
-                ForEach(0..<MessageLabel.names.count, id: \.self) { i in
+                ForEach(0..<model.settings.labels.count, id: \.self) { i in
                     Button {
                         setLabel(i, at: index)
                     } label: {
-                        if let color = ClassicStyle.labelColor(i) {
-                            Label(MessageLabel.names[i], systemImage: "circle.fill")
+                        if let color = model.settings.labelColor(i) {
+                            Label(model.settings.labelName(i),
+                                  systemImage: "circle.fill")
                                 .foregroundStyle(color)
                         } else {
-                            Text(MessageLabel.names[i])
+                            Text(model.settings.labelName(i))
                         }
                     }
                 }

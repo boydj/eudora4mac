@@ -15,10 +15,13 @@ enum ClassicStyle {
         case .unread: return "•"
         case .read: return ""
         case .replied: return "R"
+        case .redistributed: return "D"
         case .forwarded: return "F"
         case .sendable: return "·"
+        case .unsendable, .unsent: return "-"
         case .queued: return "Q"
         case .sent: return "S"
+        case .timed: return "T"
         case .rebuilt: return "?"
         case .other: return ""
         }
@@ -34,12 +37,6 @@ enum ClassicStyle {
         case 5: return "«"
         default: return ""
         }
-    }
-
-    static func labelColor(_ index: Int) -> Color? {
-        guard index > 0 && index < MessageLabel.colors.count else { return nil }
-        let c = MessageLabel.colors[index]
-        return Color(red: c.r, green: c.g, blue: c.b)
     }
 
     /// Classic summary dates: time for today, weekday for this week, short

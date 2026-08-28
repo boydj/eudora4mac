@@ -25,7 +25,8 @@ struct PreviewPane: View {
                 Divider()
                 ScrollView {
                     Text(bodyText(of: message))
-                        .font(.body.monospaced())
+                        .font(.system(size: CGFloat(model.settings.displayFontSize))
+                            .monospaced())
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)

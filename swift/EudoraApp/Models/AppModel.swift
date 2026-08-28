@@ -46,6 +46,42 @@ final class AppModel: ObservableObject {
     var settingsURL: URL { mailFolder.appendingPathComponent("EudoraSettings.json") }
     var filtersURL: URL { mailFolder.appendingPathComponent("Eudora Filters") }
     var nicknamesURL: URL { mailFolder.appendingPathComponent("Eudora Nicknames") }
+    /// Signature files live in the classic "Signature Folder".
+    var signatureFolderURL: URL {
+        mailFolder.appendingPathComponent("Signature Folder", isDirectory: true)
+    }
+
+    // MARK: signatures (plain text files, one per signature)
+
+    func signatureNames() -> [String] {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: signatureFolderURL,
+                                withIntermediateDirectories: true)
+        let names = (try? fm.contentsOfDirectory(atPath: signatureFolderURL.path)) ?? []
+        return names.filter { !$0.hasPrefix(".") }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    func signatureText(named name: String) -> String {
+        guard !name.isEmpty else { return "" }
+        let url = signatureFolderURL.appendingPathComponent(name)
+        return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    }
+
+    func saveSignature(named name: String, text: String) {
+        guard !name.isEmpty else { return }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: signatureFolderURL,
+                                withIntermediateDirectories: true)
+        try? text.write(to: signatureFolderURL.appendingPathComponent(name),
+                        atomically: true, encoding: .utf8)
+    }
+
+    func deleteSignature(named name: String) {
+        guard !name.isEmpty else { return }
+        try? FileManager.default.removeItem(
+            at: signatureFolderURL.appendingPathComponent(name))
+    }
 
     // MARK: published state
 
@@ -85,10 +121,16 @@ final class AppModel: ObservableObject {
         let fm = FileManager.default
         let contents = (try? fm.contentsOfDirectory(atPath: mailFolder.path)) ?? []
         var names = contents.filter { name in
-            !name.hasSuffix(".toc") && !name.hasSuffix(".json") &&
+            guard !name.hasSuffix(".toc") && !name.hasSuffix(".json") &&
                 !name.hasPrefix(".") && name != "Eudora Filters" &&
                 name != "Eudora Nicknames" && !name.hasSuffix(".temp") &&
                 !name.hasSuffix(".tmp")
+            else { return false }
+            // Directories (like the Signature Folder) are not mailboxes.
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: mailFolder.appendingPathComponent(name).path,
+                          isDirectory: &isDir)
+            return !isDir.boolValue
         }
         // Classic ordering: In, Out, Trash, Junk first, then alphabetical.
         names.sort {
