@@ -5,9 +5,10 @@
 // (exposing only the C interface, per core/include/module.modulemap) and
 // EudoraKit layers idiomatic Swift types over it.
 //
-// The TLS transport needs OpenSSL and is disabled in the SwiftPM build
-// (net/tls_transport.cpp compiles empty without EUDORA_HAVE_TLS); use the
-// CMake build with OpenSSL for TLS, or add a define + linker settings here.
+// TLS: on macOS the core uses the Security framework (SecureTransport
+// decorator, net/apple_tls_transport.*) with no external dependency; the
+// OpenSSL decorator (net/tls_transport.cpp) is used by CMake builds that
+// find OpenSSL and compiles empty here.
 
 import PackageDescription
 
@@ -43,6 +44,11 @@ let package = Package(
             cxxSettings: [
                 .headerSearchPath("."),
                 .headerSearchPath("include"),
+            ],
+            linkerSettings: [
+                // TLS via the Security framework (SecureTransport decorator)
+                // on Apple platforms — no OpenSSL needed.
+                .linkedFramework("Security", .when(platforms: [.macOS])),
             ]
         ),
         .target(

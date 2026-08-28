@@ -76,6 +76,15 @@ target_sources(eudora_core PRIVATE
   addressbook/nicknames.cpp
   api/eudora_core_c.cpp)
 
+# On Apple platforms the Security-framework TLS decorator is always
+# available (net/apple_tls_transport.*); OpenSSL, when found, is preferred
+# and used instead.
+if(APPLE)
+  target_sources(eudora_core PRIVATE net/apple_tls_transport.cpp)
+  target_link_libraries(eudora_core PUBLIC
+    "-framework Security" "-framework CoreFoundation")
+endif()
+
 if(EUDORA_ENABLE_TLS)
   find_package(OpenSSL QUIET)
   if((OpenSSL_FOUND OR OPENSSL_FOUND)

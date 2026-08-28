@@ -15,17 +15,20 @@ original file/line provenance noted in its header comments.
 ```sh
 cmake -B build -S core        # on macOS: configures arm64 / macOS 26 by default
 cmake --build build
-ctest --test-dir build        # 6 suites, all platform-independent
+ctest --test-dir build        # 9 suites, all platform-independent
 ```
 
 - **macOS**: `CMAKE_OSX_ARCHITECTURES=arm64` and
   `CMAKE_OSX_DEPLOYMENT_TARGET=26.0` are set automatically (override with
   the usual cache variables). Product: `libeudora_core.a` +
   `core/include/eudora/`.
-- **TLS**: `find_package(OpenSSL)`; without OpenSSL the library builds with
-  the TLS transport disabled (`EUDORA_HAVE_TLS` unset). On macOS, install
-  via Homebrew (`brew install openssl@3`) or configure with
-  `-DEUDORA_ENABLE_TLS=OFF`.
+- **TLS**: two interchangeable decorators over the same Transport seam.
+  On Apple platforms the Security-framework one
+  (`net/apple_tls_transport.*`, SecureTransport with custom I/O — the only
+  Apple API that can wrap an existing connection, which STARTTLS needs) is
+  always built, so TLS works with no external dependency. When
+  `find_package(OpenSSL)` succeeds the OpenSSL decorator is preferred; on
+  non-Apple platforms it is the only TLS option.
 - **Linux**: the same tree builds and the full test suite runs; that is how
   the port is verified in CI-like environments.
 
@@ -79,8 +82,8 @@ migrated from a real Mac (mailboxes + `.toc` files, "Eudora Filters",
 
 The repository root carries a **Swift package** (`Package.swift`): add this
 repo as a package dependency in Xcode and `import EudoraKit` — SwiftPM
-compiles the C++ core itself (TLS disabled without OpenSSL; use the CMake
-build for TLS) and `swift/EudoraKit` provides idiomatic types (`Mailbox`,
+compiles the C++ core itself (TLS included, via the Security framework)
+and `swift/EudoraKit` provides idiomatic types (`Mailbox`,
 `ParsedMessage`, `AddressBook`, `FilterSet`, `Composer`,
 `pop3Fetch`/`smtpSend`).
 

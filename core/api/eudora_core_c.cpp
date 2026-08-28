@@ -22,6 +22,8 @@
 #include "net/posix_transport.hpp"
 #if defined(EUDORA_HAVE_TLS)
 #include "net/tls_transport.hpp"
+#elif defined(__APPLE__)
+#include "net/apple_tls_transport.hpp"
 #endif
 #include "protocols/pop3.hpp"
 #include "protocols/smtp.hpp"
@@ -340,14 +342,20 @@ struct TransportBundle {
     PosixTransport plain;
 #if defined(EUDORA_HAVE_TLS)
     std::unique_ptr<TlsTransport> tls;
+#elif defined(__APPLE__)
+    std::unique_ptr<AppleTlsTransport> tls;
 #endif
     Transport *active = nullptr;
 
     // Returns nullptr and sets an error if the requested mode is impossible.
     Transport *setup(int tls_mode) {
-#if defined(EUDORA_HAVE_TLS)
+#if defined(EUDORA_HAVE_TLS) || defined(__APPLE__)
         if (tls_mode != EUDORA_TLS_NONE) {
+#if defined(EUDORA_HAVE_TLS)
             tls = std::make_unique<TlsTransport>(plain);
+#else
+            tls = std::make_unique<AppleTlsTransport>(plain);
+#endif
             active = tls.get();
         } else {
             active = &plain;
@@ -369,6 +377,11 @@ struct TransportBundle {
             return true;
         set_error(tls ? "TLS handshake failed: " + tls->last_tls_error()
                       : "TLS not configured");
+        return false;
+#elif defined(__APPLE__)
+        if (tls && tls->start_tls(host) == NetError::None)
+            return true;
+        set_error(tls ? tls->last_tls_error() : "TLS not configured");
         return false;
 #else
         (void)host;
