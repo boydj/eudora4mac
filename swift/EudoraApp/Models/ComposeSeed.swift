@@ -25,6 +25,10 @@ struct ComposeSeed: Hashable, Codable, Identifiable {
     /// Extra RFC 822 headers (e.g. In-Reply-To).
     var extraHeaders: [ExtraHeader] = []
 
+    /// Files to pre-attach (Forward re-attaches the original's attachments,
+    /// written to temp files).
+    var attachmentPaths: [String] = []
+
     /// The message this composition answers; marked when queued or sent.
     var original: OriginalRef? = nil
 

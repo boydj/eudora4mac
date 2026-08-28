@@ -114,8 +114,16 @@ What it recreates, and from where:
   reading and writing the real "Eudora Filters" file.  Filter events run
   as the original did: incoming after Check Mail, outgoing on Queue,
   manual on ⌘J.  Executed actions: transfer, copy, junk score, label,
-  status, priority (incl. raise/lower), subject, sound, notify;
-  speak/open/print/forward/redirect/reply/personality remain inert.
+  status, priority (incl. raise/lower), subject, sound, notify, **speak**
+  (AVSpeechSynthesizer, the action's phrase or the subject), **open**
+  (shows each matched message in its own window), **print**, and the
+  message-generating **forward** / **redirect** / **reply** — each builds
+  the outgoing message with the default personality (Forward re-attaches
+  the original's parts; Redirect keeps the "by way of" From; Reply's
+  parameter names an optional stationery whose text becomes the body) and
+  queues it to Out, marking the original.  Only **personality**
+  (re-homing a stored message to a personality) stays inert — it has no
+  modern analogue.
 - **The Address Book window** — nicknames, addresses, notes, expansion
   preview, saved to the real "Eudora Nicknames" file.
 - **Settings** — the classic panel-list dialog: Getting Started,

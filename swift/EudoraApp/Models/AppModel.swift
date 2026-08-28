@@ -7,7 +7,9 @@
 
 #if os(macOS)
 
+import AVFoundation // AVSpeechSynthesizer for the Speak filter action
 import AppKit
+import CEudoraCore // eudora_core_version for filter-generated X-Mailer headers
 import EudoraKit
 import Foundation
 import SwiftUI
@@ -102,6 +104,10 @@ final class AppModel: ObservableObject {
 
     /// Bumps whenever mailbox contents change so views re-query summaries.
     @Published var mailboxGeneration = 0
+
+    /// Messages a filter's Open action wants shown; MainWindow drains this
+    /// and opens a window for each, then clears it.
+    @Published var pendingMessageOpens: [MessageRef] = []
 
     private var openMailboxes: [String: Mailbox] = [:]
 
@@ -288,6 +294,7 @@ final class AppModel: ObservableObject {
         case .forward:
             seed.subject = "Fwd: " + subject
             seed.body = quoted(msg, summary: sum)
+            seed.attachmentPaths = extractAttachments(of: msg) // re-attach
             seed.original = .init(mailbox: boxName, serial: sum.serialNumber,
                                   markState: MessageState.forwarded.rawValue)
 
@@ -312,6 +319,24 @@ final class AppModel: ObservableObject {
             seed.body = normalizedBody(of: msg)
         }
         return seed
+    }
+
+    /// Write the message's attachment parts to temp files so a Forward can
+    /// re-attach them; returns the file paths.
+    private func extractAttachments(of msg: ParsedMessage) -> [String] {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("EudoraFwd-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir,
+                                                 withIntermediateDirectories: true)
+        var paths: [String] = []
+        for (n, part) in msg.attachments.enumerated() {
+            let name = part.filename.isEmpty ? "attachment-\(n + 1)" : part.filename
+            let url = dir.appendingPathComponent(name)
+            if (try? part.decode().write(to: url)) != nil {
+                paths.append(url.path)
+            }
+        }
+        return paths
     }
 
     /// Marks the message a composition answered (replied/forwarded/…),
@@ -752,7 +777,7 @@ final class AppModel: ObservableObject {
             let fired = filters.run(on: message, event: .outgoing,
                                     addressBook: book)
             var transfers: [PendingTransfer] = []
-            applyActions(fired, mailbox: out, index: index,
+            applyActions(fired, mailbox: out, boxName: "Out", index: index,
                          transfers: &transfers)
             applyTransfers(transfers, from: "Out")
         }
@@ -785,7 +810,8 @@ final class AppModel: ObservableObject {
             // TERMS can match, not just header/body string terms.
             let fired = filters.run(onMailbox: mb, index: i, event: event,
                                     addressBook: book)
-            applyActions(fired, mailbox: mb, index: i, transfers: &transfers)
+            applyActions(fired, mailbox: mb, boxName: mailboxName, index: i,
+                         transfers: &transfers)
         }
         applyTransfers(transfers, from: mailboxName)
         try? mb.save()
@@ -797,10 +823,13 @@ final class AppModel: ObservableObject {
 
     /// Executes one message's fired actions ("stop" is already handled by
     /// the engine's ordering; transfers/copies are deferred so indices
-    /// stay valid).  Unsupported classic actions (speak, open, print,
-    /// forward, redirect, reply, personality) are silently skipped.
+    /// stay valid).  The message-generating actions (Forward / Redirect /
+    /// Reply) build an outgoing message and queue it to Out, exactly as the
+    /// classic filter did; Open / Print / Speak drive the UI.  Personality
+    /// (assigning a stored message to a personality) has no modern analogue
+    /// and is skipped — see PORTING.md.
     private func applyActions(_ fired: [FiredAction], mailbox mb: Mailbox,
-                              index: Int,
+                              boxName: String, index: Int,
                               transfers: inout [PendingTransfer]) {
         for action in fired {
             switch action.keyword {
@@ -832,10 +861,149 @@ final class AppModel: ObservableObject {
                 NewMailAttention.playSound(named: action.value)
             case "notifyUser":
                 statusText = "Filter \"\(action.filterName)\" matched."
+            case "forward":
+                fireForwardLike(.forward, to: action.value, mailbox: mb,
+                                boxName: boxName, index: index)
+            case "redirect":
+                fireForwardLike(.redirect, to: action.value, mailbox: mb,
+                                boxName: boxName, index: index)
+            case "reply":
+                fireReply(cannedReply: action.value, mailbox: mb,
+                          boxName: boxName, index: index)
+            case "open":
+                if let sum = mb.summary(at: index) {
+                    pendingMessageOpens.append(
+                        MessageRef(mailbox: boxName, index: index,
+                                   serial: sum.serialNumber))
+                }
+            case "print":
+                printMessages(at: [index], in: boxName)
+            case "speak":
+                speak(phraseFor(action.value, mailbox: mb, index: index))
             default:
+                // "personality" and any keyword the port doesn't model.
                 break
             }
         }
+    }
+
+    /// The Forward / Redirect filter actions: build the outgoing message
+    /// (Forward re-attaches the original; Redirect uses the "by way of"
+    /// From) addressed to the filter's target, queue it, and mark the
+    /// original.  The default personality composes it, matching the classic
+    /// filter that had no personality picker.
+    private func fireForwardLike(_ kind: ComposeActionKind, to target: String,
+                                 mailbox mb: Mailbox, boxName: String,
+                                 index: Int) {
+        guard !target.isEmpty,
+              var seed = composeSeed(kind, mailbox: boxName, index: index)
+        else { return }
+        seed.to = target
+        queueOutgoing(from: seed)
+        markMarkState(seed.original, mailbox: mb, index: index)
+    }
+
+    /// The Reply filter action: reply to the sender.  The classic parameter
+    /// names a stationery ("canned reply"); when a matching stationery file
+    /// exists its text becomes the reply body, otherwise the quoted original
+    /// stands in.
+    private func fireReply(cannedReply: String, mailbox mb: Mailbox,
+                           boxName: String, index: Int) {
+        guard var seed = composeSeed(.reply, mailbox: boxName, index: index)
+        else { return }
+        if let text = stationeryText(named: cannedReply), !text.isEmpty {
+            seed.body = text
+        }
+        queueOutgoing(from: seed)
+        markMarkState(seed.original, mailbox: mb, index: index)
+    }
+
+    /// Stamp the reply/forward/redirect mark carried on a seed onto the
+    /// original in place (runFilters saves the box once at the end).
+    private func markMarkState(_ ref: ComposeSeed.OriginalRef?,
+                               mailbox mb: Mailbox, index: Int) {
+        guard let ref, let state = MessageState(rawValue: ref.markState) else { return }
+        mb.setState(state, at: index)
+    }
+
+    /// Body for the Speak action: the classic parameter is the phrase to
+    /// speak; an empty parameter speaks the message's subject.
+    private func phraseFor(_ value: String, mailbox mb: Mailbox, index: Int) -> String {
+        if !value.isEmpty { return value }
+        if let sum = mb.summary(at: index), !sum.subject.isEmpty {
+            return sum.subject
+        }
+        return "New mail."
+    }
+
+    private let speechSynth = AVSpeechSynthesizer()
+
+    private func speak(_ text: String) {
+        guard !text.isEmpty else { return }
+        if speechSynth.isSpeaking { speechSynth.stopSpeaking(at: .immediate) }
+        speechSynth.speak(AVSpeechUtterance(string: text))
+    }
+
+    /// Stationery lives in the classic "Stationery Folder"; returns its text
+    /// if a file of that name exists, else nil.
+    private func stationeryText(named name: String) -> String? {
+        guard !name.isEmpty else { return nil }
+        let url = mailFolder.appendingPathComponent("Stationery Folder",
+                                                    isDirectory: true)
+            .appendingPathComponent(name)
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    /// Build an outgoing message from a compose seed (the non-UI counterpart
+    /// of ComposeView.buildMessage) and queue it to Out.  Used by the
+    /// Forward / Redirect / Reply filter actions.
+    private func queueOutgoing(from seed: ComposeSeed) {
+        guard let message = buildOutgoing(from: seed),
+              let out = mailbox(named: "Out"),
+              (try? out.append(message: message, state: .queued)) != nil
+        else { return }
+        try? out.save()
+        // Bump the generation rather than dropping the cached Out handle:
+        // when a manual filter runs over Out itself, the filter loop holds
+        // that same handle, and appending to it (not a fresh one) keeps the
+        // in-memory TOC consistent with the box the loop later saves.
+        mailboxGeneration += 1
+    }
+
+    /// Renders a ComposeSeed to an RFC 822 message using the default
+    /// personality, mirroring the composer window: signature appended for
+    /// non-redirect messages, X-Mailer stamped, seed attachments carried.
+    private func buildOutgoing(from seed: ComposeSeed) -> String? {
+        guard !seed.to.isEmpty || !seed.cc.isEmpty || !seed.bcc.isEmpty
+        else { return nil }
+        let account = settings.dominant
+        var body = seed.body
+        if account.useSignature, seed.fromAddress == nil {
+            let sig = signatureText(named: account.signatureName)
+            if !sig.isEmpty {
+                if !body.hasSuffix("\n") { body += "\n" }
+                body += "\n-- \n" + sig
+            }
+        }
+        let composer = Composer()
+            .from(name: seed.fromAddress != nil ? (seed.fromName ?? "")
+                                                : account.realName,
+                  address: seed.fromAddress ?? account.emailAddress)
+            .subject(seed.subject)
+            .body(body)
+            .priority(seed.priority)
+            .header("X-Mailer",
+                    "Eudora (EudoraCore \(String(cString: eudora_core_version())))")
+        if !seed.to.isEmpty { composer.to(seed.to) }
+        if !seed.cc.isEmpty { composer.cc(seed.cc) }
+        if !seed.bcc.isEmpty { composer.bcc(seed.bcc) }
+        for extra in seed.extraHeaders {
+            composer.header(extra.name, extra.value)
+        }
+        for path in seed.attachmentPaths {
+            composer.attach(path: path)
+        }
+        return try? composer.build()
     }
 
     /// Priority action values: "1"-"5" set the display priority; the

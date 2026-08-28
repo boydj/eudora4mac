@@ -33,6 +33,9 @@ struct ComposeView: View {
         _subject = State(initialValue: seed.subject)
         _bodyText = State(initialValue: seed.body)
         _priority = State(initialValue: seed.priority)
+        _attachments = State(initialValue: seed.attachmentPaths.map {
+            URL(fileURLWithPath: $0)
+        })
     }
 
     var body: some View {

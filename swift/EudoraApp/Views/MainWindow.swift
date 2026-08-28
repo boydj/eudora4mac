@@ -29,6 +29,18 @@ struct MainWindow: View {
         }
         .toolbar { toolbarContent }
         .safeAreaInset(edge: .bottom) { statusBar }
+        .onChange(of: model.pendingMessageOpens) { pending in
+            // A filter's Open action queues messages here; open one window
+            // each and drain the queue.
+            guard !pending.isEmpty else { return }
+            for ref in pending {
+                openWindow(id: "message",
+                           value: MessageRef(mailbox: ref.mailbox,
+                                             index: ref.index,
+                                             serial: ref.serial))
+            }
+            model.pendingMessageOpens.removeAll()
+        }
         .alert("New Mailbox", isPresented: $newMailboxPrompt) {
             TextField("Name", text: $newMailboxName)
             Button("Create") {
