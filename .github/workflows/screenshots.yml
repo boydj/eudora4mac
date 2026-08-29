@@ -48,12 +48,15 @@ jobs:
           defaults write net.jbip.eudora mailFolderPath "$DEMO_FOLDER"
           defaults write net.jbip.eudora NSQuitAlwaysKeepsWindows -bool false
 
-      - name: Launch and screenshot every screen
+      - name: Render every screen to a PNG
         run: |
           set -x
           mkdir -p docs/screenshots
-          # "EUDORA_SHOT value : output file name"; the app's screenshot
-          # director (MainWindow) drives the UI to each screen on launch.
+          # "EUDORA_SHOT value : output file name". The app's screenshot
+          # director (MainWindow) drives the UI to each screen and renders that
+          # window to the PNG itself via cacheDisplay — no `screencapture`, so
+          # no macOS screen-recording permission is needed and the shot is the
+          # window only (no desktop, dock, or consent dialogs).
           shots=(
             "inbox:1-inbox.png"
             "message:2-reading-a-message.png"
@@ -64,22 +67,24 @@ jobs:
           )
           for entry in "${shots[@]}"; do
             shot="${entry%%:*}"; file="${entry##*:}"
-            echo "::group::capture $shot -> $file"
-            # launchctl setenv makes the value visible to GUI apps opened next.
+            out="$PWD/docs/screenshots/$file"
+            echo "::group::render $shot -> $file"
+            rm -f "$out"
+            # launchctl setenv makes the values visible to the GUI app.
             launchctl setenv EUDORA_SHOT "$shot"
+            launchctl setenv EUDORA_SHOT_OUT "$out"
             open dist/Eudora.app
-            sleep 12   # window build + demo TOC build + director delay
-            osascript -e 'tell application "Eudora" to activate' || true
-            sleep 2
-            screencapture -x "docs/screenshots/$file"
+            # The app writes the PNG and quits itself; wait up to ~30s.
+            for _ in $(seq 1 30); do [ -s "$out" ] && break; sleep 1; done
             killall EudoraApp 2>/dev/null || true
             launchctl unsetenv EUDORA_SHOT
-            sleep 2
-            sips -g pixelWidth -g pixelHeight "docs/screenshots/$file" || true
-            test -s "docs/screenshots/$file"
+            launchctl unsetenv EUDORA_SHOT_OUT
+            sleep 1
+            sips -g pixelWidth -g pixelHeight "$out" || true
+            test -s "$out"
             echo "::endgroup::"
           done
-          echo "--- captured images ---"
+          echo "--- rendered images ---"
           ls -l docs/screenshots
 
       - name: Upload screenshots artifact
