@@ -55,10 +55,24 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$PRODUCTS_DIR/EudoraApp" "$APP/Contents/MacOS/EudoraApp"
 
-# SwiftPM's Bundle.module accessor looks in Bundle.main.resourceURL, so
-# the package resource bundle belongs in Contents/Resources.
-if [[ -d "$PRODUCTS_DIR/$RESOURCE_BUNDLE" ]]; then
-    cp -R "$PRODUCTS_DIR/$RESOURCE_BUNDLE" "$APP/Contents/Resources/"
+# SwiftPM resource bundle (e.g. EudoraCore_EudoraApp.bundle) belongs in
+# Contents/Resources.  Match by glob so a naming change doesn't silently drop
+# it; note it plainly when there's none rather than skipping in silence.
+shopt -s nullglob
+resource_bundles=("$PRODUCTS_DIR"/*_EudoraApp.bundle "$PRODUCTS_DIR/$RESOURCE_BUNDLE")
+copied_bundle=""
+for b in "${resource_bundles[@]}"; do
+    if [[ -d "$b" && "$b" != "$copied_bundle" ]]; then
+        cp -R "$b" "$APP/Contents/Resources/"
+        copied_bundle="$b"
+        echo "bundled resources: $(basename "$b")"
+    fi
+done
+shopt -u nullglob
+if [[ -z "$copied_bundle" ]]; then
+    echo "note: no SwiftPM resource bundle found in $PRODUCTS_DIR (the app" \
+         "reads its icon from Contents/Resources directly, so this is only" \
+         "a problem if a target adds resources it loads via Bundle.module)"
 fi
 
 # The classic icon, for Finder/Dock via CFBundleIconFile.
