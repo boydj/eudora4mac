@@ -115,9 +115,14 @@ struct MailboxPane: View {
             deleteSelection()
         }
         .onChange(of: tableSelection) { newValue in
-            selectedMessage = newValue.first
+            if newValue.first != selectedMessage { selectedMessage = newValue.first }
         }
-    }
+        // Reverse sync: a selection set on the model (menu commands, the
+        // screenshot director) highlights the row and shows it in the preview.
+        .onChange(of: selectedMessage) { newValue in
+            let desired = newValue.map { Set([$0]) } ?? Set<Int>()
+            if desired != tableSelection { tableSelection = desired }
+        }
 
     // MARK: selection helpers (act across the whole multi-selection)
 

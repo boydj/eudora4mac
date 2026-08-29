@@ -81,6 +81,8 @@ jobs:
             launchctl unsetenv EUDORA_SHOT_OUT
             sleep 1
             sips -g pixelWidth -g pixelHeight "$out" || true
+            echo "captured window: $(cat "$out.windowinfo" 2>/dev/null || echo '?')"
+            rm -f "$out.windowinfo"
             test -s "$out"
             echo "::endgroup::"
           done

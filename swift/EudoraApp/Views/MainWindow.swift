@@ -92,6 +92,9 @@ struct MainWindow: View {
         case "addressbook":
             openWindow(id: "addressbook")
         case "settings":
+            NSApp.activate(ignoringOtherApps: true)
+            // Ventura+ renamed the action to showSettingsWindow:; fall back to
+            // the older name on Monterey.
             if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
                 _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
             }
@@ -116,12 +119,14 @@ struct MainWindow: View {
         let visible = NSApp.windows.filter { $0.isVisible && !($0 is NSPanel) }
         let target: NSWindow?
         if preferMainWindow {
+            // The inbox: the largest window (the main split view).
             target = visible.max {
                 $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height
             }
         } else {
-            target = NSApp.keyWindow
-                ?? NSApp.orderedWindows.first { visible.contains($0) }
+            // The other screens: the window just opened (frontmost in z-order).
+            target = NSApp.orderedWindows.first { visible.contains($0) }
+                ?? NSApp.keyWindow
                 ?? visible.first
         }
         guard let window = target,
@@ -132,6 +137,11 @@ struct MainWindow: View {
         if let data = rep.representation(using: .png, properties: [:]) {
             try? data.write(to: URL(fileURLWithPath: path))
         }
+        // A diagnostic sidecar so CI can log which window was captured.
+        let info = "\(window.title.isEmpty ? "(untitled)" : window.title) " +
+            "\(Int(frame.bounds.width))x\(Int(frame.bounds.height))"
+        try? info.write(toFile: path + ".windowinfo", atomically: true,
+                        encoding: .utf8)
     }
 
     private var sidebar: some View {
