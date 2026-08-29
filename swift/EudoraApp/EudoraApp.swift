@@ -73,6 +73,17 @@ struct EudoraApp: App {
             SettingsView()
                 .environmentObject(model)
         }
+
+        // A plain window hosting the same SettingsView, used only by the
+        // screenshot director (the Settings *scene* can't be opened by
+        // openWindow, and showSettingsWindow: doesn't fire on a headless
+        // runner).  Nothing in the UI opens this, so a normal launch never
+        // shows it; ⌘, still opens the real Settings scene above.
+        Window("Settings", id: "settings-shot") {
+            SettingsView()
+                .environmentObject(model)
+                .frame(minWidth: 720, minHeight: 480)
+        }
     }
 
     @CommandsBuilder

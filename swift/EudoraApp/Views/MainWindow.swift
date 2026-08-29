@@ -5,6 +5,7 @@
 
 #if os(macOS)
 
+import AppKit
 import EudoraKit
 import SwiftUI
 
@@ -51,6 +52,93 @@ struct MainWindow: View {
         } message: {
             Text("Creating a mailbox called:")
         }
+        .task { await runScreenshotDirectorIfRequested() }
+    }
+
+    /// Screenshot support (used only by the Screenshots CI action): when the
+    /// EUDORA_SHOT environment variable names a screen, drive the UI to it on
+    /// launch.  If EUDORA_SHOT_OUT is also set, the app renders that window to
+    /// a PNG itself (no `screencapture`, so no screen-recording permission is
+    /// needed and the shot is the window only) and quits.  A no-op otherwise.
+    @MainActor
+    private func runScreenshotDirectorIfRequested() async {
+        let env = ProcessInfo.processInfo.environment
+        guard let shot = env["EUDORA_SHOT"], !shot.isEmpty else { return }
+        // Let the window and mailbox list build first.
+        try? await Task.sleep(nanoseconds: 1_800_000_000)
+        model.selectedMailbox = "In"
+
+        func firstInboxRef() -> MessageRef? {
+            guard let mb = model.mailbox(named: "In"), mb.count > 0,
+                  let sum = mb.summary(at: 0) else { return nil }
+            return MessageRef(mailbox: "In", index: 0, serial: sum.serialNumber)
+        }
+
+        switch shot {
+        case "inbox", "main":
+            // Select the first message so the preview shows an open email.
+            model.selectedMessage = 0
+        case "message":
+            model.selectedMessage = 0
+            if let ref = firstInboxRef() { openWindow(id: "message", value: ref) }
+        case "compose":
+            if let seed = model.composeSeed(.reply, mailbox: "In", index: 0) {
+                openWindow(id: "compose", value: seed)
+            } else {
+                openWindow(id: "compose")
+            }
+        case "filters":
+            openWindow(id: "filters")
+        case "addressbook":
+            openWindow(id: "addressbook")
+        case "settings":
+            // Open the screenshot-only Settings window (the Settings scene
+            // itself can't be driven by openWindow / showSettingsWindow: here).
+            openWindow(id: "settings-shot")
+        default:
+            break
+        }
+
+        guard let out = env["EUDORA_SHOT_OUT"], !out.isEmpty else { return }
+        // Let the target window lay out and its content (message body, etc.)
+        // render before snapshotting it.
+        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        let wantsMain = (shot == "inbox" || shot == "main")
+        captureWindow(to: out, preferMainWindow: wantsMain)
+        NSApp.terminate(nil)
+    }
+
+    /// Renders a window's own view hierarchy (including the title bar) to a PNG
+    /// with `cacheDisplay` — no screen capture, no TCC permission.  For the
+    /// inbox it snapshots the largest window (the main split view); for the
+    /// other screens, the front/key window (the dialog just opened).
+    private func captureWindow(to path: String, preferMainWindow: Bool) {
+        let visible = NSApp.windows.filter { $0.isVisible && !($0 is NSPanel) }
+        let target: NSWindow?
+        if preferMainWindow {
+            // The inbox: the largest window (the main split view).
+            target = visible.max {
+                $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height
+            }
+        } else {
+            // The other screens: the window just opened (frontmost in z-order).
+            target = NSApp.orderedWindows.first { visible.contains($0) }
+                ?? NSApp.keyWindow
+                ?? visible.first
+        }
+        guard let window = target,
+              let frame = window.contentView?.superview ?? window.contentView,
+              let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds)
+        else { return }
+        frame.cacheDisplay(in: frame.bounds, to: rep)
+        if let data = rep.representation(using: .png, properties: [:]) {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+        // A diagnostic sidecar so CI can log which window was captured.
+        let info = "\(window.title.isEmpty ? "(untitled)" : window.title) " +
+            "\(Int(frame.bounds.width))x\(Int(frame.bounds.height))"
+        try? info.write(toFile: path + ".windowinfo", atomically: true,
+                        encoding: .utf8)
     }
 
     private var sidebar: some View {
