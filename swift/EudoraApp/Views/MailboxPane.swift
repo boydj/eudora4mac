@@ -123,6 +123,7 @@ struct MailboxPane: View {
             let desired = newValue.map { Set([$0]) } ?? Set<Int>()
             if desired != tableSelection { tableSelection = desired }
         }
+    }
 
     // MARK: selection helpers (act across the whole multi-selection)
 
