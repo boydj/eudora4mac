@@ -19,10 +19,13 @@ final class EudoraAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
-        // The classic Eudora icon, carried over from the legacy bundle.
-        // (A bundled Xcode build would set this via CFBundleIconFile; doing
-        // it at runtime also covers `swift run`.)
-        if let url = Bundle.module.url(forResource: "Eudora", withExtension: "icns"),
+        // The classic Eudora icon.  The bundled app carries it at
+        // Contents/Resources/Eudora.icns (also its CFBundleIconFile), so read
+        // it from Bundle.main — NOT Bundle.module, whose SwiftPM accessor
+        // fatalErrors at launch when the resource bundle isn't found on an
+        // end user's machine.  Bundle.main.url returns nil instead, so a
+        // `swift run` (where the icns isn't beside the binary) just skips it.
+        if let url = Bundle.main.url(forResource: "Eudora", withExtension: "icns"),
            let icon = NSImage(contentsOf: url) {
             NSApp.applicationIconImage = icon
         }
