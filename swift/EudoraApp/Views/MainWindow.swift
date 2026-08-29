@@ -92,12 +92,9 @@ struct MainWindow: View {
         case "addressbook":
             openWindow(id: "addressbook")
         case "settings":
-            NSApp.activate(ignoringOtherApps: true)
-            // Ventura+ renamed the action to showSettingsWindow:; fall back to
-            // the older name on Monterey.
-            if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
-                _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-            }
+            // Open the screenshot-only Settings window (the Settings scene
+            // itself can't be driven by openWindow / showSettingsWindow: here).
+            openWindow(id: "settings-shot")
         default:
             break
         }

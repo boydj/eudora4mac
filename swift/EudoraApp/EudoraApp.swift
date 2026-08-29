@@ -73,6 +73,19 @@ struct EudoraApp: App {
             SettingsView()
                 .environmentObject(model)
         }
+
+        // Screenshot support: the Settings *scene* can't be opened by
+        // openWindow, and showSettingsWindow: doesn't fire reliably on a
+        // headless runner, so when EUDORA_SHOT is set expose the same view as
+        // a plain window the screenshot director can open.  This scene does
+        // not exist in a normal launch.
+        if ProcessInfo.processInfo.environment["EUDORA_SHOT"] != nil {
+            Window("Settings", id: "settings-shot") {
+                SettingsView()
+                    .environmentObject(model)
+                    .frame(minWidth: 720, minHeight: 480)
+            }
+        }
     }
 
     @CommandsBuilder
